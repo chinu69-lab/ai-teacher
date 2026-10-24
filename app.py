@@ -55,7 +55,7 @@ def parse_json_text(text):
     return json.loads(text[start:end + 1])
 
 
-def ask_json(system_prompt, user_prompt, temperature=0.3, retries=3):
+def ask_json(system_prompt, user_prompt, usage_state, temperature=0.3, retries=3):
     # Ask the model and return a Python dict. Retries on rate limits (429) and bad JSON.
     client = get_client()                            # raises a clear message when the key is missing
     use_json_mode = True
@@ -73,7 +73,9 @@ def ask_json(system_prompt, user_prompt, temperature=0.3, retries=3):
             if use_json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
             reply = client.chat.completions.create(**kwargs)
-            return parse_json_text(reply.choices[0].message.content)
+            response_text = reply.choices[0].message.content or ""
+            track_token_usage(usage_state, reply.usage, len(response_text))
+            return parse_json_text(response_text)
         except AuthenticationError:                  # wrong key: retrying cannot help
             raise RuntimeError("Groq rejected this API key. Check the key in the sidebar and try again.")
         except Exception as e:                       # rate limit, network, or bad JSON
@@ -82,6 +84,45 @@ def ask_json(system_prompt, user_prompt, temperature=0.3, retries=3):
                 use_json_mode = False
             time.sleep(2 * (attempt + 1))            # wait a little longer each time
     raise RuntimeError(f"The AI model failed after {retries} tries: {last_error}")
+
+
+def track_token_usage(S, usage, generated_chars=0):
+    input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0
+    output_tokens = int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0
+    if not input_tokens and not output_tokens and not generated_chars:
+        return
+
+    def add_usage(state):
+        totals = state.setdefault("token_usage", {"input": 0, "output": 0, "generated_chars": 0})
+        totals["input"] += input_tokens
+        totals["output"] += output_tokens
+        totals["generated_chars"] = totals.get("generated_chars", 0) + generated_chars
+
+    add_usage(S)
+    live_state = st.session_state.get("S")
+    if live_state is not None and live_state is not S and live_state.get("learner") == S.get("learner"):
+        add_usage(live_state)
+
+
+def usage_snapshot(S):
+    usage = S.get("token_usage", {})
+    return {
+        "input": int(usage.get("input", 0)),
+        "output": int(usage.get("output", 0)),
+        "generated_chars": int(usage.get("generated_chars", 0)),
+    }
+
+
+def usage_difference(after, before):
+    return {key: after[key] - before[key] for key in before}
+
+
+def add_usage_totals(*usages):
+    return {
+        key: sum(usage.get(key, 0) for usage in usages)
+        for key in ("input", "output", "generated_chars")
+    }
+
 
 # ---------------- DATA SHAPES (Pydantic) + QUESTION CHECKER ----------------
 # Pydantic makes sure the AI's JSON has the right fields before we use it.
@@ -292,7 +333,7 @@ def make_quiz(S):
     user = f"Topic: {S['topic']}\nClaimed level: {S['profile'].get('level')}"
     if S["material"]:
         user += "\nUse ONLY this source material:\n" + material_overview(S["material"], 3000)
-    data = ask_json(system, user)
+    data = ask_json(system, user, S)
     good = []
     for raw in data.get("questions", []):
         try:
@@ -328,7 +369,7 @@ def make_lesson_plan(S):
                  + material_overview(S["material"]))
     for attempt in range(3):
         try:
-            plan = LessonPlan.model_validate(ask_json(system, user))
+            plan = LessonPlan.model_validate(ask_json(system, user, S))
             if plan.concepts:
                 return [c.model_dump() for c in plan.concepts][:NUM_CONCEPTS]
         except ValidationError:
@@ -386,7 +427,7 @@ def write_concept(S, concept, method, kind, extra="", style=""):
     last_error = None
     for attempt in range(3):
         try:
-            content = ConceptContent.model_validate(ask_json(system, user))
+            content = ConceptContent.model_validate(ask_json(system, user, S))
             problems = check_question(content.question, kind)       # normal-code check
             if problems:
                 raise ValueError("; ".join(problems))
@@ -424,7 +465,7 @@ def evaluate_answer(S, q, answer):
             "Checklist:\n- " + "\n- ".join(q["checklist"]) + f"\n\nLearner's answer: {answer}")
     for attempt in range(2):
         try:
-            ev = EvalResult.model_validate(ask_json(system, user, temperature=0.1)).model_dump()
+            ev = EvalResult.model_validate(ask_json(system, user, S, temperature=0.1)).model_dump()
             ev["skipped"] = False
             return ev
         except ValidationError:
@@ -446,6 +487,8 @@ def new_state():
         "wrong_streak": 0, "attempts": 0, "rescue_used": False, "return_to": None,
         "methods_tried": [], "needs_revision": [], "completed": [],
         "asked": {}, "history": [], "last_eval": None, "action": None, "log": [],
+        "last_question_usage": {"input": 0, "output": 0, "generated_chars": 0},
+        "token_usage": {"input": 0, "output": 0, "generated_chars": 0},
     }
 
 
@@ -545,7 +588,9 @@ def generate_content(S, method, extra="", style=""):
         method = "final"
     concept = current_concept(S)
     kind = pick_kind(S, method)
+    usage_before = usage_snapshot(S)
     content = write_concept(S, concept, method, kind, extra, style)
+    content["question_usage"] = usage_difference(usage_snapshot(S), usage_before)
     content["method"] = method
     S["content"], S["phase"] = content, "question"
     S["qcount"] += 1
@@ -556,7 +601,7 @@ def generate_content(S, method, extra="", style=""):
 
 def begin_lesson(T):
     # Architect makes the plan, Content agent writes the first part. T is a working copy.
-    keep = ("learner", "topic", "material", "profile", "quiz")
+    keep = ("learner", "topic", "material", "profile", "quiz", "token_usage")
     T.update({k: v for k, v in new_state().items() if k not in keep})
     T["plan"] = make_lesson_plan(T)
     T["log"].append(f"Architect planned {len(T['plan'])} concepts")
@@ -568,6 +613,7 @@ def process_answer(S, answer, skipped=False):
     # Called when the learner submits. Evaluate -> update counters -> Orchestrator decides.
     q = S["content"]["question"]
     concept = current_concept(S)
+    usage_before_evaluation = usage_snapshot(S)
     if skipped:                                     # "I don't know" is useful information, not a mistake
         ev = {"result": "wrong", "right": "", "missing": "", "misconception": "", "skipped": True,
               "feedback": "That's okay. Not knowing is useful information for me, so I will help in a different way.",
@@ -577,6 +623,12 @@ def process_answer(S, answer, skipped=False):
         ev, shown = check_mcq(q, answer), q["options"][answer]
     else:
         ev, shown = evaluate_answer(S, q, answer), answer    # the only AI call here (may raise an error)
+    evaluation_usage = usage_difference(usage_snapshot(S), usage_before_evaluation)
+    question_usage = add_usage_totals(
+        S["content"].get("question_usage", {}),
+        evaluation_usage,
+    )
+    S["last_question_usage"] = question_usage
     S["attempts"] += 1
     if ev["result"] == "correct":
         S["wrong_streak"] = 0
@@ -867,6 +919,14 @@ def sidebar(S):
             if S["profile"] and S["profile"].get("level_note"):
                 st.caption(f"Level {S['profile']['level_note']}")
 
+        usage = S.get("token_usage", {})
+        st.markdown(
+            "**LLM token usage**  \n"
+            f"Input: **{int(usage.get('input', 0)):,}** | "
+            f"Output: **{int(usage.get('output', 0)):,}**  \n"
+            f"Generated characters: **{int(usage.get('generated_chars', 0)):,}**"
+        )
+
         if S["plan"]:
             revision = [r["concept"] for r in S["needs_revision"]]
             rows = ['<div class="plan-title">Lesson plan</div>']
@@ -1104,6 +1164,13 @@ def show_feedback(S):
         kind, mark, word = "bad", "&#10005;", "Not quite"
     gagne("Gagné step 7: feedback")
     st.markdown(f'<div class="verdict {kind}"><span class="mk">{mark}</span><span>{word}</span></div>', unsafe_allow_html=True)
+    usage = S.get("last_question_usage", {})
+    st.caption(
+        "This question + answer usage — "
+        f"Input: {int(usage.get('input', 0)):,} tokens | "
+        f"Output: {int(usage.get('output', 0)):,} tokens | "
+        f"Generated: {int(usage.get('generated_chars', 0)):,} characters"
+    )
     with st.container(key="fb_card"):
         st.markdown(ev["feedback"])
         if ev.get("right"):

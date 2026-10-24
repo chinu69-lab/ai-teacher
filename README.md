@@ -15,6 +15,7 @@ Built with [Streamlit](https://streamlit.io) and the [Groq](https://groq.com) AP
 4. **Evaluator** checks written answers against a checklist. Multiple-choice answers are checked by plain code.
 5. **Orchestrator** (simple if/else rules) decides the next move: continue, give a hint, change the style, go back, or show a worked example.
 6. Progress is saved in SQLite so a learner can resume. You can also upload a PDF and the lesson is built only from it.
+7. The sidebar shows cumulative input/output tokens and generated response characters for the lesson. After each answer, the feedback screen shows the usage for generating that question and evaluating the answer.
 
 ## How to use the app
 
