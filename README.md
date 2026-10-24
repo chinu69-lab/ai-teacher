@@ -32,7 +32,7 @@ The key is typed by each visitor and kept only in that visitor's browser session
 ├── requirements.txt        # Python packages
 ├── README.md
 └── .streamlit/
-    └── config.toml         # light theme and colours (keep this folder name exactly)
+    └── config.toml         # dark theme and colours (keep this folder name exactly)
 ```
 
 ## Run it on your computer
@@ -47,6 +47,8 @@ Then open <http://localhost:8501>.
 ## Deploy on Streamlit Community Cloud (free)
 
 1. Create a new GitHub repository and upload all the files above, including the `.streamlit` folder.
+   The folder name starts with a dot and must sit in the **root** of the repository, next to `app.py`.
+   If it is missing, the app still opens, but the widgets may not match the dark design.
 2. Go to <https://share.streamlit.io> and sign in with GitHub.
 3. Click **Create app**, choose your repository and branch, and set **Main file path** to `app.py`.
 4. Under **Advanced settings**, pick Python **3.12** (3.11 or 3.13 also work).
@@ -81,6 +83,7 @@ Open `app.py` and edit the values near the top:
 - **Saved progress is temporary on Streamlit Cloud.** The SQLite file (`tutor.db`) is erased when the app restarts or redeploys.
 - **Progress is saved under the name a learner types.** Anyone who types the same name on the same app can resume that lesson, so do not use this version for private data.
 - Apps on the free tier go to sleep after a period of inactivity. Open the link and press the wake-up button.
+- The app uses a dark theme only. `config.toml` also hides the viewer's theme switcher so nobody can switch it to light.
 - If you see "Groq rejected this API key", paste the key again. It must start with `gsk_`.
 - Scanned PDFs without selectable text cannot be read.
 
