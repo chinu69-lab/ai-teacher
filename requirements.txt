@@ -8,3 +8,4 @@ odfpy>=1.4.1
 striprtf>=0.0.26
 fastembed>=0.7.3
 rank-bm25>=0.2.2
+nemoguardrails>=0.18.0,<1.0.0
