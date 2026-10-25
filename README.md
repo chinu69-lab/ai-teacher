@@ -14,14 +14,17 @@ Built with [Streamlit](https://streamlit.io) and the [Groq](https://groq.com) AP
 3. **Content Agent** writes one small concept at a time using Merrill's First Principles.
 4. **Evaluator** checks written answers against a checklist. Multiple-choice answers are checked by plain code.
 5. **Orchestrator** (simple if/else rules) decides the next move: continue, give a hint, change the style, go back, or show a worked example.
-6. Progress is saved in SQLite so a learner can resume. You can also upload a PDF and the lesson is built only from it.
+6. Progress is saved in SQLite so a learner can resume. You can also upload PDF, PowerPoint (`.pptx`), Word (`.docx` and `.doc`), OpenDocument Text (`.odt`), plain text (`.txt`), or RTF (`.rtf`) notes; the lesson uses their readable text.
 7. The sidebar shows cumulative input/output tokens and generated response characters for the lesson. After each answer, the feedback screen shows the usage for generating that question and evaluating the answer.
+8. The app checks whether a topic is clear and compatible with uploaded notes before planning a lesson.
+9. Uploaded notes use hybrid retrieval: BM25 finds exact keyword matches, BGE-small embeddings find semantically related passages, and Reciprocal Rank Fusion combines the rankings.
+10. The sidebar has Home and Profiles & activity navigation. The activity dashboard summarizes saved profiles and shows each profile's question history.
 
 ## How to use the app
 
 1. Open the app.
 2. In the **left sidebar**, paste your Groq API key and press Enter. Get a free key at <https://console.groq.com/keys>.
-3. Type your name and a topic (or upload a PDF), then press **Start lesson**.
+3. Type your name and a topic (or upload supported notes), then press **Start lesson**.
 
 The key is typed by each visitor and kept only in that visitor's browser session. It is never written to the code, the database or GitHub.
 
@@ -44,6 +47,10 @@ streamlit run app.py
 ```
 
 Then open <http://localhost:8501>.
+
+Reading older Word `.doc` files also requires the `antiword` system utility. Install it separately and make sure it is on your `PATH`; `.docx` files do not need it.
+
+The first lesson using uploaded notes downloads the `BAAI/bge-small-en-v1.5` embedding model. The model is cached for later retrievals while the app process is running.
 
 ## Deploy on Streamlit Community Cloud (free)
 
@@ -77,16 +84,22 @@ Open `app.py` and edit the values near the top:
 | `NUM_CONCEPTS` | Concepts planned per lesson (plus a final challenge) | `3` |
 | `MAX_ATTEMPTS_PER_CONCEPT` | Safety limit for the teaching loop | `8` |
 | `LESSON_LANGUAGE` | Language of lessons and feedback | `English` |
-| `CHUNK_SIZE` | Characters per PDF chunk | `1500` |
+| `CHUNK_SIZE` | Maximum characters per uploaded document chunk | `1500` |
+| `CHUNK_OVERLAP` | Context characters carried between adjacent chunks | `150` |
+| `EMBEDDING_MODEL` | Local model used for semantic document retrieval | `BAAI/bge-small-en-v1.5` |
 
 ## Good to know
 
+- **The Profiles & activity dashboard is public.** Anyone who visits the app can see learner names, profile settings, topics, questions, answers, and results. Do not use it with private or sensitive learner information.
+- A profile is identified by the learner name. Reusing a name resumes/overwrites that saved profile rather than creating a separate account.
 - **Saved progress is temporary on Streamlit Cloud.** The SQLite file (`tutor.db`) is erased when the app restarts or redeploys.
 - **Progress is saved under the name a learner types.** Anyone who types the same name on the same app can resume that lesson, so do not use this version for private data.
 - Apps on the free tier go to sleep after a period of inactivity. Open the link and press the wake-up button.
 - The app uses a dark theme only. `config.toml` also hides the viewer's theme switcher so nobody can switch it to light.
 - If you see "Groq rejected this API key", paste the key again. It must start with `gsk_`.
-- Scanned PDFs without selectable text cannot be read.
+- Scanned PDFs and image-only PowerPoint slides without readable text cannot be read.
+- Uploaded documents are split recursively at paragraph, line, sentence, and word boundaries, with overlap between adjacent chunks to retain context.
+- Older Word `.doc` files require `antiword`; modern `.docx` files do not.
 
 ## Project summary
 

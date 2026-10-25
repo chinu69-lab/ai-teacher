@@ -3,20 +3,27 @@
 #  An adaptive AI teacher made of small agents + a rule-based Orchestrator.
 #  Run locally:  streamlit run app.py      Deploy: Streamlit Community Cloud (see README.md)
 # =====================================================================
-import os, re, json, time, copy, random, sqlite3, html
+import os, re, json, time, copy, random, sqlite3, html, math
+import shutil, subprocess, tempfile
 from contextlib import contextmanager
+from io import BytesIO
 from typing import List, Optional, Literal
 
 import streamlit as st
+from fastembed import TextEmbedding
 from groq import Groq, AuthenticationError
 from pydantic import BaseModel, Field, ValidationError
+from rank_bm25 import BM25Okapi
 
 # ---------------- SETTINGS (edit these values to change the behaviour) ----------------
 MODEL = "openai/gpt-oss-120b"        # Groq model used by every agent
 NUM_CONCEPTS = 3                      # how many concepts the Architect plans (+1 final challenge)
 MAX_ATTEMPTS_PER_CONCEPT = 8          # safety limit: the teaching loop can never run forever
 LESSON_LANGUAGE = "English"           # language of lessons, questions and feedback
-CHUNK_SIZE = 1500                     # characters per PDF chunk
+CHUNK_SIZE = 1500                     # maximum characters per source-document chunk
+CHUNK_OVERLAP = 150                   # context carried over between adjacent chunks
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+RRF_K = 60
 DB_PATH = os.environ.get("DB_PATH", "tutor.db")            # SQLite file (on Streamlit Cloud it resets when the app restarts)
 
 # ---------------- ONE PLACE THAT TALKS TO THE LLM ----------------
@@ -149,7 +156,7 @@ class ConceptContent(BaseModel):
     explanation: str
     example: str = ""
     hint: str = ""
-    source_quote: str = ""      # a sentence copied from the PDF (used to verify PDF lessons)
+    source_quote: str = ""      # a sentence copied from uploaded notes for source verification
     question: Question
 
 class EvalResult(BaseModel):
@@ -234,7 +241,21 @@ def log_answer(S, concept, q, answer, result):
     with db() as con:
         con.execute("INSERT INTO answers (learner, topic, concept, kind, question, answer, result, created) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (S["learner"], S["topic"], concept, q["kind"], q["text"], str(answer)[:500], result, time.time()))
+                    (S["learner"], S["topic"], concept, q["kind"], q["text"], str(answer)[:500],
+                     "skipped" if result == "skipped" else result, time.time()))
+
+
+def load_profile_activity():
+    with db() as con:
+        profiles = con.execute(
+            "SELECT learner, state_json, updated FROM sessions ORDER BY updated DESC"
+        ).fetchall()
+        answers = con.execute(
+            "SELECT learner, topic, concept, kind, question, answer, "
+            "CASE WHEN result = 'wrong' AND answer = '(I don''t know)' THEN 'skipped' ELSE result END, created "
+            "FROM answers ORDER BY created DESC, id DESC"
+        ).fetchall()
+    return profiles, answers
 
 
 def delete_learner(learner):
@@ -243,7 +264,7 @@ def delete_learner(learner):
         con.execute("DELETE FROM sessions WHERE learner = ?", (learner,))
         con.execute("DELETE FROM answers WHERE learner = ?", (learner,))
 
-# ---------------- PDF READING AND SIMPLE RETRIEVAL ----------------
+# ---------------- SOURCE DOCUMENT READING AND SIMPLE RETRIEVAL ----------------
 def read_pdf(file_bytes, filename="notes.pdf"):
     # Read text with PyMuPDF, keep paragraphs, collect short heading-like lines, make chunks.
     try:
@@ -266,19 +287,238 @@ def read_pdf(file_bytes, filename="notes.pdf"):
                 headings.append(text)
     if sum(len(p) for p in paragraphs) < 200:
         raise ValueError("no readable text found (is it a scanned PDF?)")
-    chunks, current = [], ""
-    for p in paragraphs:                            # join paragraphs into chunks of ~CHUNK_SIZE characters
-        if current and len(current) + len(p) > CHUNK_SIZE:
-            chunks.append(current.strip())
-            current = ""
-        current += p + "\n"
-    if current.strip():
-        chunks.append(current.strip())
-    return {"name": filename, "chunks": chunks, "headings": headings}
+    return _document_from_paragraphs(filename, paragraphs, headings, min_chars=200)
+
+
+def _recursive_split(text, max_size, separators):
+    if len(text) <= max_size:
+        return [text]
+
+    for index, separator in enumerate(separators):
+        parts = re.split(f"({separator})", text)
+        if len(parts) == 1:
+            continue
+
+        units = [parts[0]]
+        for part_index in range(1, len(parts), 2):
+            following = parts[part_index + 1] if part_index + 1 < len(parts) else ""
+            units.append(parts[part_index] + following)
+
+        groups, current = [], ""
+        for unit in units:
+            if current and len(current) + len(unit) > max_size:
+                groups.append(current)
+                current = ""
+            if len(unit) > max_size:
+                if current:
+                    groups.append(current)
+                    current = ""
+                groups.extend(_recursive_split(unit, max_size, separators[index + 1:]))
+            else:
+                current += unit
+        if current:
+            groups.append(current)
+        return groups
+
+    return [text[index:index + max_size] for index in range(0, len(text), max_size)]
+
+
+def _recursive_chunks(paragraphs):
+    text = "\n\n".join(paragraphs)
+    core_size = max(1, CHUNK_SIZE - CHUNK_OVERLAP)
+    cores = _recursive_split(
+        text,
+        core_size,
+        (r"\n\n", r"(?<=[.!?])\s+", r"\s+"),
+    )
+
+    chunks = []
+    for index, core in enumerate(cores):
+        overlap = ""
+        if index and CHUNK_OVERLAP > 0:
+            previous = cores[index - 1]
+            overlap_start = max(0, len(previous) - CHUNK_OVERLAP)
+            word_boundary = previous.find(" ", overlap_start)
+            if word_boundary >= 0:
+                overlap_start = word_boundary + 1
+            overlap = previous[overlap_start:]
+        chunk = (overlap + core).strip()
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+
+def _document_from_paragraphs(filename, paragraphs, headings=None, min_chars=1):
+    paragraphs = [" ".join(paragraph.split()) for paragraph in paragraphs]
+    paragraphs = [paragraph for paragraph in paragraphs if paragraph]
+    if sum(len(paragraph) for paragraph in paragraphs) < min_chars:
+        raise ValueError("no readable text found in the document")
+
+    if headings is None:
+        headings = [
+            paragraph for paragraph in paragraphs
+            if len(paragraph) < 80 and not paragraph.endswith((".", ",", ";"))
+            and any(ch.isalpha() for ch in paragraph)
+        ]
+    else:
+        headings = [" ".join(heading.split()) for heading in headings if heading.strip()]
+
+    return {
+        "name": filename,
+        "chunks": _recursive_chunks(paragraphs),
+        "headings": headings[:40],
+    }
+
+
+def read_pptx(file_bytes, filename="notes.pptx"):
+    from pptx import Presentation
+
+    presentation = Presentation(BytesIO(file_bytes))
+    paragraphs, headings = [], []
+    for slide in presentation.slides:
+        for shape in slide.shapes:
+            texts = []
+            if shape.has_text_frame:
+                texts.extend(paragraph.text for paragraph in shape.text_frame.paragraphs)
+            if shape.has_table:
+                texts.extend(
+                    cell.text
+                    for row in shape.table.rows
+                    for cell in row.cells
+                )
+            for text in texts:
+                text = " ".join(text.split())
+                if not text:
+                    continue
+                paragraphs.append(text)
+                if len(text) < 80 and not text.endswith((".", ",", ";")) and any(ch.isalpha() for ch in text):
+                    headings.append(text)
+
+    if sum(len(paragraph) for paragraph in paragraphs) < 30:
+        raise ValueError("no readable text found in the PowerPoint")
+
+    return _document_from_paragraphs(filename, paragraphs, headings, min_chars=30)
+
+
+def read_docx(file_bytes, filename="notes.docx"):
+    from docx import Document
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    document = Document(BytesIO(file_bytes))
+    paragraphs, headings = [], []
+    for element in document.element.body.iterchildren():
+        if element.tag.endswith("}p"):
+            paragraph = Paragraph(element, document)
+            text = paragraph.text
+            if paragraph.style and paragraph.style.name.startswith("Heading"):
+                headings.append(text)
+            paragraphs.append(text)
+        elif element.tag.endswith("}tbl"):
+            table = Table(element, document)
+            paragraphs.extend(
+                " ".join(cell.text for cell in row.cells)
+                for row in table.rows
+            )
+    return _document_from_paragraphs(filename, paragraphs, headings)
+
+
+def read_odt(file_bytes, filename="notes.odt"):
+    from odf import teletype
+    from odf.opendocument import load
+
+    document = load(BytesIO(file_bytes))
+    paragraphs, headings = [], []
+
+    def collect_text(element):
+        for child in element.childNodes:
+            tag_name = getattr(child, "tagName", None)
+            if tag_name in ("text:p", "text:h"):
+                text = teletype.extractText(child)
+                paragraphs.append(text)
+                if tag_name == "text:h":
+                    headings.append(text)
+            else:
+                collect_text(child)
+
+    collect_text(document.text)
+    return _document_from_paragraphs(filename, paragraphs, headings)
+
+
+def read_rtf(file_bytes, filename="notes.rtf"):
+    from striprtf.striprtf import rtf_to_text
+
+    try:
+        rtf = file_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        rtf = file_bytes.decode("cp1252")
+    text = rtf_to_text(rtf)
+    return _document_from_paragraphs(filename, text.splitlines())
+
+
+def read_doc(file_bytes, filename="notes.doc"):
+    antiword = shutil.which("antiword")
+    if not antiword:
+        raise ValueError(
+            "reading legacy .doc files requires antiword; install it and restart the app"
+        )
+
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as source:
+            source.write(file_bytes)
+            path = source.name
+        result = subprocess.run(
+            [antiword, path],
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("the Word document took too long to read") from error
+    finally:
+        if path and os.path.exists(path):
+            os.remove(path)
+
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise ValueError(detail or "could not read the legacy Word document")
+    try:
+        text = result.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        text = result.stdout.decode("cp1252")
+    return _document_from_paragraphs(filename, text.splitlines())
+
+
+def read_txt(file_bytes, filename="notes.txt"):
+    try:
+        text = file_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = file_bytes.decode("cp1252")
+    return _document_from_paragraphs(filename, text.splitlines())
+
+
+def read_document(file_bytes, filename):
+    extension = os.path.splitext(filename)[1].lower()
+    if extension == ".pdf":
+        return read_pdf(file_bytes, filename)
+    if extension == ".pptx":
+        return read_pptx(file_bytes, filename)
+    if extension == ".docx":
+        return read_docx(file_bytes, filename)
+    if extension == ".doc":
+        return read_doc(file_bytes, filename)
+    if extension == ".odt":
+        return read_odt(file_bytes, filename)
+    if extension == ".txt":
+        return read_txt(file_bytes, filename)
+    if extension == ".rtf":
+        return read_rtf(file_bytes, filename)
+    raise ValueError("unsupported file type; upload a PDF, PowerPoint, Word, ODT, TXT, or RTF file")
 
 
 def material_overview(material, max_chars=6000):
-    # A short overview of the whole PDF for the Architect (headings + a few chunks)
+    # A short overview of uploaded notes for the Architect (headings + a few chunks)
     if not material:
         return ""
     text = "Headings found: " + "; ".join(material["headings"][:25]) + "\n\n"
@@ -291,19 +531,59 @@ def material_overview(material, max_chars=6000):
     return text
 
 
+@st.cache_resource(show_spinner=False)
+def get_embedding_model(model_name):
+    return TextEmbedding(model_name=model_name)
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def embed_chunks(chunks, model_name):
+    model = get_embedding_model(model_name)
+    return [embedding.tolist() for embedding in model.embed(list(chunks))]
+
+
+def retrieval_tokens(text):
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def cosine_similarity(left, right):
+    dot = sum(float(a) * float(b) for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(float(value) ** 2 for value in left))
+    right_norm = math.sqrt(sum(float(value) ** 2 for value in right))
+    denominator = left_norm * right_norm
+    return dot / denominator if denominator else 0.0
+
+
 def pick_chunks(material, query, k=2):
-    # Very simple retrieval: choose the chunks that share the most words with the concept.
-    words = [w for w in re.findall(r"[a-zA-Z]{4,}", query.lower())]
-    scored = []
-    for i, chunk in enumerate(material["chunks"]):
-        low = chunk.lower()
-        scored.append((sum(low.count(w) for w in words), -i, chunk))
-    scored.sort(reverse=True)
-    return "\n---\n".join(c for _, _, c in scored[:k])
+    chunks = material["chunks"]
+    if not chunks:
+        return ""
+
+    tokenized_chunks = [retrieval_tokens(chunk) for chunk in chunks]
+    bm25_scores = BM25Okapi(tokenized_chunks).get_scores(retrieval_tokens(query))
+    bm25_ranking = sorted(range(len(chunks)), key=lambda i: (-bm25_scores[i], i))
+
+    model = get_embedding_model(EMBEDDING_MODEL)
+    query_embedding = next(model.query_embed(
+        "Represent this sentence for searching relevant passages: " + query
+    ))
+    chunk_embeddings = embed_chunks(tuple(chunks), EMBEDDING_MODEL)
+    vector_scores = [
+        cosine_similarity(query_embedding, embedding)
+        for embedding in chunk_embeddings
+    ]
+    vector_ranking = sorted(range(len(chunks)), key=lambda i: (-vector_scores[i], i))
+
+    fused_scores = {index: 0.0 for index in range(len(chunks))}
+    for ranking in (bm25_ranking, vector_ranking):
+        for rank, index in enumerate(ranking, start=1):
+            fused_scores[index] += 1 / (RRF_K + rank)
+    best = sorted(fused_scores, key=lambda i: (-fused_scores[i], i))[:k]
+    return "\n---\n".join(chunks[index] for index in best)
 
 
 def quote_in_material(quote, material):
-    # Hallucination check (normal code): is the quoted sentence really inside the PDF?
+    # Check in normal code that the quoted sentence appears in the uploaded notes.
     norm = lambda t: " ".join(t.lower().split())
     quote = norm(quote)
     if len(quote) < 15 or not material:
@@ -322,6 +602,35 @@ def default_profile():
 
 def profile_text(p):
     return f"level = {p.get('level')}, goal = {p.get('goal')}, likes = {p.get('style')}"
+
+
+class InvalidTopicError(ValueError):
+    pass
+
+
+class TopicReview(BaseModel):
+    is_valid: bool
+    reason: str = ""
+
+
+def validate_topic(topic, material, usage_state):
+    system = (
+        "You check whether a requested subject is clear and suitable for a short educational lesson. "
+        "Accept recognizable academic, practical, creative, and general-interest topics. Reject only "
+        "empty, incoherent, or impossible-to-identify topics. If source material is provided, also check "
+        "that the requested topic is supported by it; when the topic is just a filename, infer the subject "
+        "from the material. Do not reject a topic merely because it is unfamiliar or advanced. "
+        'Return JSON: {"is_valid":true,"reason":""}. If invalid, set is_valid to false and give a brief, '
+        "helpful reason and suggestion."
+    )
+    user = f"Requested lesson topic: {topic}"
+    if material:
+        user += "\nUploaded source material:\n" + material_overview(material, 2500)
+
+    review = TopicReview.model_validate(ask_json(system, user, usage_state))
+    if not review.is_valid:
+        reason = review.reason.strip() or "I could not identify a clear lesson topic."
+        raise InvalidTopicError(f"That topic may not work for a lesson: {reason}")
 
 
 def make_quiz(S):
@@ -434,7 +743,7 @@ def write_concept(S, concept, method, kind, extra="", style=""):
             if kind == "mcq":
                 shuffle_options(content.question)
             result = content.model_dump()
-            if material:                                             # verify the lesson against the PDF
+            if material:                                             # verify the lesson against uploaded notes
                 result["source_status"] = "verified" if quote_in_material(content.source_quote, material) else "unverified"
             else:
                 result["source_status"] = "none"
@@ -641,7 +950,7 @@ def process_answer(S, answer, skipped=False):
         mark_revision(S, "Applying all ideas (final challenge)")
     S["history"].append({"concept": concept["title"], "method": S["content"]["method"], "kind": q["kind"],
                          "answer": str(shown)[:200], "result": "skipped" if ev["skipped"] else ev["result"]})
-    log_answer(S, concept["title"], q, shown, ev["result"])
+    log_answer(S, concept["title"], q, shown, "skipped" if ev["skipped"] else ev["result"])
     S["log"].append(f"Evaluator: {ev['result']}  ->  Orchestrator: {action}")
     S["last_eval"], S["action"], S["phase"] = ev, action, "feedback"
     save_progress(S)
@@ -750,6 +1059,11 @@ section[data-testid="stSidebar"] [data-testid^="stBaseButton-"]{width:100%;}
 [data-testid="stFileUploaderDropzone"],[data-testid="stFileUploaderDropzone"] small,[data-testid="stFileUploaderDropzone"] span{color:var(--soft);}
 [data-testid="stExpander"]{border:1px solid var(--line);border-radius:12px;background:var(--card);}
 [data-testid="stAlert"]{border-radius:12px;}
+.warning-box{display:flex;align-items:flex-start;gap:.65rem;border:1px solid rgba(255,200,87,.42);
+  border-left:4px solid var(--mid);background:var(--mid-bg);color:#FFE9B3;
+  border-radius:0 12px 12px 0;padding:.8rem 1rem;margin:.8rem 0;line-height:1.5;}
+.warning-box strong{color:var(--mid);font-family:var(--head);font-size:.82rem;letter-spacing:.06em;flex:none;}
+.warning-box span{color:#FFE9B3;}
 [role="radiogroup"]{gap:.5rem;}
 [role="radiogroup"] label{
   background:var(--field);border:1.5px solid var(--line);border-radius:12px;padding:.6rem .9rem;
@@ -865,6 +1179,14 @@ def esc(text):
     return html.escape(" ".join(str(text).split()), quote=True)
 
 
+def show_warning(message):
+    st.markdown(
+        f'<div class="warning-box" role="alert"><strong>WARNING</strong>'
+        f'<span>{esc(message)}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+
 def page_head(title, sub=""):
     st.markdown(f'<div class="page-head"><h1>{esc(title)}</h1>' + (f"<p>{esc(sub)}</p>" if sub else "") + "</div>",
                 unsafe_allow_html=True)
@@ -906,6 +1228,14 @@ def sidebar(S):
     with st.sidebar:
         st.markdown('<div class="brand">AI Teacher</div>'
                     '<div class="brand-sub">Lessons that adapt when you get stuck</div>', unsafe_allow_html=True)
+        if st.button("Home", key="nav_home", use_container_width=True):
+            S.clear()
+            S.update(new_state())
+            st.session_state["app_view"] = "home"
+            st.rerun()
+        if st.button("Profiles & activity", key="nav_profiles", use_container_width=True):
+            st.session_state["app_view"] = "dashboard"
+            st.rerun()
         key_box()
         st.markdown('<hr class="side-rule">', unsafe_allow_html=True)
 
@@ -998,7 +1328,7 @@ def screen_start(S):
     st.markdown(HERO_HTML, unsafe_allow_html=True)
     has_key = bool(current_key())
     if not has_key:
-        st.markdown('<div class="callout warn">Add your Groq API key in the sidebar to begin. '
+        st.markdown('<div class="callout warn"><b>WARNING</b> Add your Groq API key in the sidebar to begin. '
                     'Keys are free at <a href="https://console.groq.com/keys" target="_blank" rel="noopener noreferrer">'
                     "console.groq.com/keys</a>.</div>", unsafe_allow_html=True)
     go = False
@@ -1010,29 +1340,47 @@ def screen_start(S):
             if st.button("Resume this lesson"):
                 S.clear()
                 S.update(saved)
+                st.session_state["app_view"] = "lesson"
                 st.rerun()
         topic = st.text_input("What do you want to learn?", placeholder="For example: Python loops, or machine learning basics")
-        pdf = st.file_uploader("Or upload your notes as a PDF (optional)", type=["pdf"])
+        source_file = st.file_uploader(
+            "Or upload your notes as a supported document (optional)",
+            type=["pdf", "pptx", "docx", "doc", "odt", "txt", "rtf"],
+        )
         go = st.button("Start lesson", type="primary", disabled=not has_key)
     if go:
         if not name.strip():
-            st.warning("Type your name first.")
+            show_warning("Type your name first.")
             return
-        if not topic.strip() and pdf is None:
-            st.warning("Type a topic or upload a PDF.")
+        if not topic.strip() and source_file is None:
+            show_warning("Type a topic or upload a document.")
             return
         material = None
-        if pdf is not None:
+        if source_file is not None:
             try:
-                with st.spinner("Reading your PDF..."):
-                    material = read_pdf(pdf.getvalue(), pdf.name)
+                with st.spinner("Reading your notes..."):
+                    material = read_document(source_file.getvalue(), source_file.name)
             except Exception as e:
-                st.error(f"I could not read this PDF ({e}). Try another file or type a topic.")
+                st.error(f"I could not read this file ({e}). Try another file or type a topic.")
                 return
         fresh = new_state()
-        fresh.update(learner=name.strip(), material=material, stage="profile",
-                     topic=topic.strip() or os.path.splitext(pdf.name)[0])
+        fresh.update(
+            learner=name.strip(),
+            material=material,
+            stage="profile",
+            topic=topic.strip() or os.path.splitext(source_file.name)[0],
+        )
+        try:
+            with st.spinner("Checking that your topic is clear..."):
+                validate_topic(fresh["topic"], material, fresh)
+        except InvalidTopicError as e:
+            show_warning(f"{e} Please enter a clear topic or choose notes that match it.")
+            return
+        except Exception as e:
+            st.error(f"I could not check this topic because the AI service failed: {e}")
+            return
         commit(S, fresh)
+        st.session_state["app_view"] = "lesson"
         st.rerun()
 
 
@@ -1109,7 +1457,7 @@ def show_lesson(S, concept, c):
                 st.markdown(f'<p class="recall"><b>You may already know:</b> {esc(concept["recall"])}</p>',
                             unsafe_allow_html=True)
         elif c["method"] != "final":
-            st.markdown('<div class="callout warn"><b>New approach from the tutor:</b> '
+            st.markdown('<div class="callout"><b>New approach from the tutor:</b> '
                         f'{esc(METHOD_LABEL.get(c["method"], c["method"]))}</div>', unsafe_allow_html=True)
         gagne("Gagné step 4: present the new idea" if c["method"] != "final"
               else "Gagné steps 8 and 9: test what you learned and use it in real life")
@@ -1119,13 +1467,10 @@ def show_lesson(S, concept, c):
                 st.markdown("**Example**")
                 st.markdown(c["example"])
     if c["source_status"] == "verified":
-        st.markdown('<div class="src ok">&#10003; This explanation is supported by your PDF.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="src ok">&#10003; This explanation is supported by your uploaded notes.</div>', unsafe_allow_html=True)
     elif c["source_status"] == "unverified":
-        st.markdown('<div class="src warn">I could not match this explanation to a sentence in your PDF. '
+        st.markdown('<div class="src warn">I could not match this explanation to a sentence in your notes. '
                     "Please double-check it.</div>", unsafe_allow_html=True)
-    if c.get("hint"):
-        with st.expander("Need a hint?"):
-            st.write(c["hint"])
 
 
 def show_question(S, q):
@@ -1208,8 +1553,74 @@ def screen_learning(S):
     if S["phase"] == "question":
         show_lesson(S, concept, c)
         show_question(S, q)
+        if c.get("hint"):
+            with st.expander("Need a hint?"):
+                st.write(c["hint"])
     else:
         show_feedback(S)
+
+
+def screen_profiles():
+    page_head("Profiles & activity", "Saved learner profiles and their question history.")
+    show_warning(
+        "This dashboard is visible to every app visitor. Learner names, topics, questions, and answers "
+        "shown here are not private."
+    )
+    profile_rows, answer_rows = load_profile_activity()
+    answers_by_learner = {}
+    for learner, topic, concept, kind, question, answer, result, created in answer_rows:
+        answers_by_learner.setdefault(learner, []).append({
+            "Topic": topic,
+            "Concept": concept,
+            "Question type": "Multiple choice" if kind == "mcq" else "Written",
+            "Question": question,
+            "Answer": answer,
+            "Result": result.title(),
+            "Submitted": time.strftime("%Y-%m-%d %H:%M", time.localtime(created)),
+        })
+
+    total_attempts = len(answer_rows)
+    total_correct = sum(1 for row in answer_rows if row[6] == "correct")
+    total_wrong = sum(1 for row in answer_rows if row[6] == "wrong")
+    total_skipped = sum(1 for row in answer_rows if row[6] == "skipped")
+    metric_columns = st.columns(5)
+    for column, label, value in zip(
+        metric_columns,
+        ("Profiles", "Questions attempted", "Correct", "Wrong", "Skipped"),
+        (len(profile_rows), total_attempts - total_skipped, total_correct, total_wrong, total_skipped),
+    ):
+        column.metric(label, value)
+
+    if not profile_rows:
+        st.info("No saved learner profiles yet. Go Home to create the first profile.")
+        return
+
+    for learner, state_json, updated in profile_rows:
+        state = json.loads(state_json)
+        learner_answers = answers_by_learner.get(learner, [])
+        wrong = sum(1 for row in learner_answers if row["Result"] == "Wrong")
+        skipped = sum(1 for row in learner_answers if row["Result"] == "Skipped")
+        correct = sum(1 for row in learner_answers if row["Result"] == "Correct")
+        profile = state.get("profile") or {}
+        topic = state.get("topic") or "No topic yet"
+        updated_text = time.strftime("%Y-%m-%d %H:%M", time.localtime(updated))
+        with st.expander(f"{learner} — {topic}"):
+            st.markdown(
+                f"**Level:** {esc(profile.get('level', 'Not set'))}  \n"
+                f"**Goal:** {esc(profile.get('goal', 'Not set'))}  \n"
+                f"**Learning style:** {esc(profile.get('style', 'Not set'))}  \n"
+                f"**Lesson status:** {esc(state.get('stage', 'unknown').title())}  \n"
+                f"**Last updated:** {updated_text}"
+            )
+            stats = st.columns(4)
+            stats[0].metric("Questions attempted", len(learner_answers) - skipped)
+            stats[1].metric("Correct", correct)
+            stats[2].metric("Wrong", wrong)
+            stats[3].metric("Skipped", skipped)
+            if learner_answers:
+                st.dataframe(learner_answers, hide_index=True, use_container_width=True)
+            else:
+                st.caption("No question attempts recorded for this profile yet.")
 
 
 def screen_done(S):
@@ -1258,9 +1669,17 @@ def main():
     if "S" not in st.session_state:
         st.session_state["S"] = new_state()
     S = st.session_state["S"]
+    if "app_view" not in st.session_state:
+        st.session_state["app_view"] = "lesson"
     sidebar(S)
+    if st.session_state["app_view"] == "dashboard":
+        screen_profiles()
+        return
+    if st.session_state["app_view"] == "home":
+        screen_start(S)
+        return
     if S["stage"] != "start" and not current_key():
-        st.markdown('<div class="callout warn">Your Groq API key is missing. Add it in the sidebar to continue.</div>',
+        st.markdown('<div class="callout warn"><b>WARNING</b> Your Groq API key is missing. Add it in the sidebar to continue.</div>',
                     unsafe_allow_html=True)
     screens = {"start": screen_start, "profile": screen_profile, "quiz": screen_quiz,
                "learning": screen_learning, "done": screen_done}
