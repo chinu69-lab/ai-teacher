@@ -15,7 +15,7 @@ Built with [Streamlit](https://streamlit.io) and the [Groq](https://groq.com) AP
 7. The sidebar shows cumulative input/output tokens and generated response characters. Feedback shows usage for generating a question and evaluating its answer.
 8. The app checks whether a topic is clear and compatible with uploaded notes before planning a lesson.
 9. Uploaded notes use hybrid retrieval: BM25 finds exact keyword matches, BGE-small embeddings find semantically related passages, and Reciprocal Rank Fusion combines the rankings.
-10. **Profiles & activity** summarizes saved profiles and question history.
+10. **Profiles & activity** summarizes saved profiles and question history, including the topic and uploaded-notes extraction status.
 11. The top-right **Project guide** opens project documentation and offers a Markdown download.
 12. **Observability** shows agent traces, LLM-as-Judge quality scores, extracted chunks, BM25/vector/RRF rankings, and human-labeled precision@k/recall@k evaluations.
 13. NeMo Guardrails can run input and output safety checks through Groq; its decisions are visible in Observability.
@@ -101,11 +101,12 @@ Open `app.py` and edit settings near the top:
 - **Profiles & activity is public.** Anyone who visits the app can see learner names, profile settings, topics, questions, answers, and results. Do not use it with private or sensitive learner information.
 - A profile is identified by learner name. Reusing a name resumes or overwrites that profile.
 - Saved SQLite progress is temporary on Streamlit Community Cloud and may be erased when the app restarts or redeploys.
+- Topic and uploaded filename are saved as a draft before document extraction or AI topic validation, so they remain visible in Profiles & activity and Observability even when either operation fails; an existing saved lesson with a topic is preserved.
 - The app has no authentication. Anyone using the same learner name on the same app can resume that lesson.
 - Scanned PDFs and image-only slides cannot be read; OCR and direct image input are not implemented.
 - Documents are split recursively at paragraph, sentence, and word boundaries, with overlap between adjacent chunks.
 - Hybrid retrieval combines BM25 exact-term search and embedding semantic search using RRF.
-- NeMo Guardrails checks use the configured Groq model and can add up to two model calls per agent call, increasing latency and token usage. Judge scores also add a Groq request per generated lesson segment.
+- NeMo Guardrails checks use the configured Groq model and can add up to two model calls per agent call, increasing latency and token usage. The topic-review request uses its own safety validation and response schema instead of the generic NeMo input/output rails. If a NeMo check fails, the error appears in Observability and the app continues with its prompt-level safeguards; explicit safety blocks still stop other requests. Judge scores also add a Groq request per generated lesson segment.
 - LLM-as-Judge scores are advisory, not ground truth. The exact Groq judge model ID must be enabled for your account.
 
 ## Project guide
