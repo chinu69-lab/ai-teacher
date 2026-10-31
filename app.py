@@ -58,6 +58,30 @@ def parse_guardrail_decision(response: str):
     if decision == "yes":
         return [False]
     return [False]
+
+
+def safe_exception_summary(error):
+    """Return exception class/status only; never expose provider messages or prompts."""
+    chain = []
+    current = error
+    deepest = error
+    seen = set()
+    for _ in range(4):
+        if not isinstance(current, BaseException) or id(current) in seen:
+            break
+        seen.add(id(current))
+        chain.append(type(current).__name__)
+        nested = getattr(current, "inner_exception", None)
+        if not isinstance(nested, BaseException):
+            nested = current.__cause__ or current.__context__
+        if isinstance(nested, BaseException):
+            deepest = nested
+        current = nested
+    status = getattr(error, "status", None)
+    if not isinstance(status, int) or status <= 0:
+        status = getattr(deepest, "status_code", None)
+    summary = " -> ".join(chain) or "UnknownError"
+    return f"{summary} (HTTP {status})" if isinstance(status, int) and status > 0 else summary
 NUM_CONCEPTS = 3                      # how many concepts the Architect plans (+1 final challenge)
 MAX_ATTEMPTS_PER_CONCEPT = 8          # safety limit: the teaching loop can never run forever
 LESSON_LANGUAGE = "English"           # language of lessons, questions and feedback
@@ -306,12 +330,14 @@ def run_nemo_guardrail(S, direction, messages):
             "rail": rail_name,
         }
     except Exception as e:
+        error_type = safe_exception_summary(e)
+        LOGGER.warning("NeMo %s safety check failed (%s).", direction, error_type)
         record_guardrail_event(
             S, direction, "ERROR", f"self check {direction}",
-            (time.perf_counter() - started) * 1000, type(e).__name__,
+            (time.perf_counter() - started) * 1000, error_type,
         )
         return {"allowed": False, "status": "ERROR", "content": "", "rail": "",
-                "error_type": type(e).__name__}
+                "error_type": error_type}
 
 
 def parse_json_text(text):
