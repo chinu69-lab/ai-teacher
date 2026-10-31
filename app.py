@@ -388,7 +388,8 @@ def _ask_json(system_prompt, user_prompt, usage_state, temperature, retries,
                 record_agent_event(usage_state, agent, selected_model, "error", 0, 0, 0, 0,
                                    f"NeMoInput{input_rail['status'].title()}")
                 raise GuardrailsUnavailableError(
-                    "NeMo input safety check could not run. Check the API key and Guardrail Decision Log, then retry."
+                    f"NeMo input safety check failed ({input_rail.get('error_type') or 'unknown error'}). "
+                    "Check Observability, then retry."
                 )
             record_agent_event(usage_state, agent, selected_model, "blocked", 0, 0, 0, 0, "NeMoInputRail")
             raise GuardrailsBlockedError("NeMo Guardrails blocked this request.")
@@ -439,7 +440,8 @@ def _ask_json(system_prompt, user_prompt, usage_state, temperature, retries,
                             f"NeMoOutput{output_rail['status'].title()}",
                         )
                         raise GuardrailsUnavailableError(
-                            "NeMo output safety check could not run. The response was not shown; check Observability and retry."
+                            f"NeMo output safety check failed ({output_rail.get('error_type') or 'unknown error'}). "
+                            "The response was not shown. Check Observability, then retry."
                         )
                     record_agent_event(
                         usage_state, agent, selected_model, "blocked", attempts,
@@ -2888,6 +2890,7 @@ def screen_observability(S):
                     "Rail Flow": row[3],
                     "Latency": f"{row[4]:.0f} ms",
                     "Model": row[5],
+                    "Error type": row[6] or "—",
                 })
             st.dataframe(g_table, hide_index=True, use_container_width=True)
         else:
