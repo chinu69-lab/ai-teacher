@@ -8,6 +8,14 @@ Learners enter a name and topic, optionally upload source notes, and choose thei
 
 The learning-style choice is visible during the lesson and guides the generated explanations and questions. Options include simple explanations, real-life examples, step-by-step practice, hands-on projects, interactive Q&A, quizzes and challenges, visual explanations, theory followed by practice, exam and interview preparation, and analogies and storytelling.
 
+## Episodic memory
+
+The **Episodic memory** view displays the records saved after each submitted lesson answer. Each episode contains the learner name, lesson run ID in storage, topic, concept, question, submitted answer, result, teaching method, orchestrator's next action, and timestamp. Existing answer-history rows are brought into the episode table on startup; because the older table did not store method or next action, those fields are marked as not recorded. The view can filter by learner and shows the stored question and answer text so records are inspectable. The active lesson state remains working memory; episode records are durable history in the configured SQLite or PostgreSQL database. Episodes are written alongside the existing answer history and are removed by **Delete my saved data**. When a learner starts another lesson on the same topic, up to eight recent episodes with recorded methods guide content generation through concept/result/method/next-action fields; old question and answer text are not passed to the model.
+
+Memory is visible to app visitors because the app has no authentication. Do not store sensitive learner information. The companion **Procedural memory** view aggregates outcomes by learner, level, and teaching strategy. It balances exposure to the three alternate explanation styles until each has at least two outcomes, then selects the style with the highest correct-answer rate; ties favor the less-tried style. This updates only the alternate style choice during the existing rule-based recovery flow. It does not generate a semantic learner profile or claim mastery from the small sample.
+
+Procedural memory records strategy name, learner level, trial count, correct/partial/unsuccessful counts, and last update time. It does not store answers again. Its counts are derived from episode outcomes and are removed by **Delete my saved data**. Existing historical answer rows are not used for strategy scoring because they did not store which teaching method was used.
+
 ## How the AI agents work
 
 - **Learner Profiler:** creates an optional quick check and uses the result to adjust the learner's starting level.
@@ -16,11 +24,15 @@ The learning-style choice is visible during the lesson and guides the generated 
 - **Evaluator:** checks written responses against a checklist; multiple-choice answers are scored in Python.
 - **Orchestrator:** uses rule-based logic to choose the next step, such as continuing, giving a hint, retrying, revisiting an earlier concept, or showing a worked example.
 
+The **Procedural memory** policy currently helps select among the three alternate explanation styles after the Orchestrator decides that a change of style is needed. It records outcomes separately for each learner and level. The existing rule sequence remains explicit; procedural memory does not replace it.
+
 The Groq model is configured by `MODEL` near the top of `app.py`. A learner supplies a Groq API key in the sidebar; the key is held in the Streamlit session and is not written to the SQLite database.
 
 ## Observability
 
-Open **Observability** in the sidebar to inspect document extraction/chunking, model calls, judge assessments, and retrieval quality. The selected lesson summary displays the learner, topic, uploaded filename, extraction status, lesson stage, and profile settings. The selector recovers saved lesson details for the current learner when the live page state is empty. Call traces record a random run ID, agent name, model, success/error status, retry count, latency, and token counts. Telemetry tables do not store prompts, learner answers, topics, or retrieved document text.
+Open **Observability** in the sidebar to inspect document extraction/chunking, model calls, judge assessments, and retrieval quality. The selected lesson summary displays the learner, topic, uploaded filename, extraction status, lesson stage, and profile settings. The selector recovers saved lesson details for the current learner when the live page state is empty. Lesson-specific telemetry is filtered in the database by run ID before applying the row limit, so busy deployments do not hide older traces. Call traces record a random run ID, agent name, model, success/error status, retry count, latency, and token counts. Telemetry tables do not store prompts, learner answers, topics, or retrieved document text.
+
+Optional Langfuse tracing can be enabled with the `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_BASE_URL` environment variables or Streamlit secrets. It records agent-call spans, nested Groq generations, and metadata-only RAG/guardrail spans; prompts, outputs, and learner/document content are not sent. See `README.md` for setup.
 
 New lesson segments are scored by an LLM-as-Judge using overall, accuracy, relevance, clarity, learner-fit, and safety scores from 1 to 5. The default model ID is `qwen/qwen3.8-27b`; confirm it is available to your Groq account or override it with `GROQ_JUDGE_MODEL`. The judge adds one Groq call per generated segment and uses the learner's Groq key. A rejected model ID or judge error is recorded but does not block lesson generation. Scores are advisory, not ground truth.
 
@@ -30,9 +42,9 @@ Automated evaluation assesses whether retrieved chunks contain the key facts req
 
 ## AI guardrails
 
-Every model call receives shared safety and trust-boundary instructions. When NeMo Guardrails is installed and enabled, its input and output self-check rails check model requests and responses, except the topic-review request: this call has its own topic-safety policy and makes the explicit topic decision, and its response is validated against the `TopicReview` schema. NeMo connects to Groq's OpenAI-compatible endpoint using the session's Groq key; the Observability page shows the sanitized config and pass/block/error trace. A NeMo service error is recorded and the request continues under the app's prompt-level safeguards; an explicit NeMo safety block on other input or output still stops the request. Learner text and uploaded notes are treated as untrusted content, not instructions. Topic review rejects unclear requests and requests for actionable help causing harm, self-harm, crimes, exploitation, or evading safeguards, while allowing safe high-level, historical, preventive, and defensive education. Model responses are also parsed and checked against Pydantic schemas and question-format rules before use.
+Every model call receives shared safety and trust-boundary instructions. When NeMo Guardrails is installed, its input and output self-check rails check model requests and responses, except the topic-review request: this call has its own topic-safety policy and makes the explicit topic decision, and its response is validated against the `TopicReview` schema. NeMo connects to Groq's OpenAI-compatible endpoint using the session's Groq key; the Observability page shows whether the rails are unavailable, awaiting initialization, initialized, or have recorded pass/block/error events. If the library is unavailable, a check errors, or a safety decision is unclear, generation stops. Learner text and uploaded notes are treated as untrusted content, not instructions. Topic review rejects unclear requests and requests for actionable help causing harm, self-harm, crimes, exploitation, or evading safeguards, while allowing safe high-level, historical, preventive, and defensive education. Model responses are also parsed and checked against Pydantic schemas and question-format rules before use.
 
-Install `nemoguardrails` from `requirements.txt` in the Python environment that runs Streamlit. If the package is unavailable, the app reports that state in Observability and continues with the existing prompt-level safeguards. These checks reduce risk but are not a guarantee that every model response is safe or correct. Review generated lessons, and do not enter credentials or sensitive personal information in topics, notes, or answers.
+Install `nemoguardrails` from `requirements.txt` in the Python environment that runs Streamlit. If the package or its Groq check is unavailable, AI generation stops instead of silently continuing. LLM self-checks can still make mistakes; review generated lessons, and do not enter credentials or sensitive personal information in topics, notes, or answers.
 
 ## Uploaded documents
 
@@ -58,16 +70,16 @@ This recursive strategy keeps related text together where possible, while the ov
 
 ## Project files and settings
 
-- `app.py` contains the Streamlit interface, agents, document readers, retrieval functions, SQLite persistence, and orchestration rules.
+- `app.py` contains the Streamlit interface, agents, document readers, retrieval functions, SQLite/PostgreSQL persistence, and orchestration rules.
 - `requirements.txt` lists Python dependencies.
 - `config.toml` and `.streamlit/config.toml` contain Streamlit theme configuration; the app uses `.streamlit/config.toml` when deployed from the repository root.
 - `README.md` contains setup and deployment instructions.
-- `tutor.db` is created at runtime and stores saved learner state and answer history.
+- `tutor.db` is created at runtime when SQLite is used and stores saved learner state and answer history.
 
-Important settings near the top of `app.py` include the model, number of lesson concepts, language, chunk size, chunk overlap, embedding model, and database path. The default database is local SQLite. On Streamlit Community Cloud, local files can be temporary and may be lost on restart or redeployment.
+Important settings near the top of `app.py` include the model, number of lesson concepts, language, chunk size, chunk overlap, embedding model, and database path. The default database is local SQLite. Configure the `SUPABASE_DB_URL` Streamlit secret (or `DATABASE_URL` environment variable) for PostgreSQL persistence. On Streamlit Community Cloud, local files can be temporary and may be lost on restart or redeployment; see `README.md` for setup.
 
 ## Privacy and deployment notes
 
-The app has no authentication. The Profiles & activity view can show saved learner names, topics, questions, answers, and results to visitors of the deployed app. Do not use it with private or sensitive learner data. Anyone using the same learner name may resume that saved profile.
+The app has no authentication. The Profiles & activity and Episodic memory views can show saved learner names, topics, questions, answers, and results to visitors of the deployed app. Do not use it with private or sensitive learner data. Anyone using the same learner name may resume that saved profile.
 
 Install the packages with `pip install -r requirements.txt`, then start the app with `streamlit run app.py`. The first source-based lesson may download the embedding model; later use can reuse the cached model. For deployment, follow the Streamlit Community Cloud steps in `README.md` and store any owner-provided Groq API key in Streamlit secrets, never in source code.

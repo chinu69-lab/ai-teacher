@@ -16,9 +16,11 @@ Built with [Streamlit](https://streamlit.io) and the [Groq](https://groq.com) AP
 8. The app checks whether a topic is clear and compatible with uploaded notes before planning a lesson.
 9. Uploaded notes use hybrid retrieval: BM25 finds exact keyword matches, BGE-small embeddings find semantically related passages, and Reciprocal Rank Fusion combines the rankings.
 10. **Profiles & activity** summarizes saved profiles and question history, including the topic and uploaded-notes extraction status.
-11. The top-right **Project guide** opens project documentation and offers a Markdown download.
-12. **Observability** shows agent traces, LLM-as-Judge quality scores, extracted chunks, BM25/vector/RRF rankings, and human-labeled precision@k/recall@k evaluations.
-13. NeMo Guardrails can run input and output safety checks through Groq; its decisions are visible in Observability.
+11. **Episodic memory** shows the saved record for each submitted answer: topic, concept, question, answer, result, teaching method, next action, and timestamp. Recent result/method metadata from the same topic can guide a returning learner's next lesson.
+12. **Procedural memory** shows teaching-strategy outcome counts and, after enough examples, favors the alternate explanation style that has worked best for that learner and level.
+13. The top-right **Project guide** opens project documentation and offers a Markdown download.
+14. **Observability** shows agent traces, LLM-as-Judge quality scores, extracted chunks, BM25/vector/RRF rankings, and human-labeled precision@k/recall@k evaluations.
+15. NeMo Guardrails can run input and output safety checks through Groq; its decisions are visible in Observability.
 
 ## How to use the app
 
@@ -71,6 +73,16 @@ The first lesson using uploaded notes downloads the `BAAI/bge-small-en-v1.5` emb
 4. Under **Advanced settings**, choose Python 3.12 (3.11 or 3.13 also work).
 5. Click **Deploy**. When deployment finishes, you get a public link.
 
+### Keep learner and observability data across restarts
+
+Streamlit Community Cloud's local filesystem is temporary. For persistent profiles, uploaded-note extraction state, and observability traces, create a Supabase project and add its PostgreSQL connection URI to the app's **Settings → Secrets**:
+
+```toml
+SUPABASE_DB_URL = "postgresql://..."
+```
+
+In Supabase, use the session-pooler connection URI (or another PostgreSQL URI reachable by the app) and require SSL. Keep this secret out of the repository. The app creates its tables and indexes on startup. Existing SQLite records are not automatically copied into Supabase; the new database starts empty. If this secret is not configured, the app continues to use local `tutor.db`; the Observability page warns that this data may be erased on a Cloud restart. For local development, SQLite remains the default; `DB_PATH` can override its file location.
+
 ### Optional: use your own key for everyone
 
 By default each visitor pastes their own key. To use an owner-provided key, add this under Streamlit Cloud app secrets:
@@ -80,6 +92,18 @@ GROQ_API_KEY = "gsk_your_key_here"
 ```
 
 Everyone using the app then spends the owner's Groq quota. A key typed in the sidebar takes precedence. Never put a real key in a file uploaded to GitHub.
+
+### Enable Langfuse LLM tracing
+
+Create a Langfuse project and add its keys under the Streamlit app's **Settings → Secrets**:
+
+```toml
+LANGFUSE_PUBLIC_KEY = "pk-lf-..."
+LANGFUSE_SECRET_KEY = "sk-lf-..."
+LANGFUSE_BASE_URL = "https://cloud.langfuse.com"
+```
+
+Set `LANGFUSE_BASE_URL` to the host for your Langfuse region or self-hosted instance. The app creates an agent-call span for each model request and a nested Groq generation with model and token counts. It also creates metadata-only spans for RAG retrieval and NeMo guardrail checks. It intentionally does not send prompts, model responses, learner names, answers, or uploaded-note contents to Langfuse. Without both keys, existing in-app observability continues to work and external tracing stays disabled.
 
 ## Settings
 
@@ -99,14 +123,17 @@ Open `app.py` and edit settings near the top:
 ## Good to know
 
 - **Profiles & activity is public.** Anyone who visits the app can see learner names, profile settings, topics, questions, answers, and results. Do not use it with private or sensitive learner information.
+- Episodic memory is also visible to app visitors. It stores one record for each submitted answer, including the question and answer text, result, teaching method, next action, topic, concept, and time. Use **Delete my saved data** in the sidebar to remove a learner's episodes along with their profile and answer history.
+- When a learner starts another lesson on the same topic, up to eight recent episodes with recorded teaching methods are included as concept/result/method/next-action metadata in content-generation context. Past question and answer text are not sent as memory context.
+- Procedural memory stores per-learner, per-level strategy counts and is visible in its sidebar view. It uses answer outcomes to guide future alternate explanation styles; it does not store learner answer text separately.
 - A profile is identified by learner name. Reusing a name resumes or overwrites that profile.
-- Saved SQLite progress is temporary on Streamlit Community Cloud and may be erased when the app restarts or redeploys.
+- Local SQLite progress is temporary on Streamlit Community Cloud and may be erased when the app restarts or redeploys. Configure `SUPABASE_DB_URL` as described above for persistent storage.
 - Topic and uploaded filename are saved as a draft before document extraction or AI topic validation, so they remain visible in Profiles & activity and Observability even when either operation fails; an existing saved lesson with a topic is preserved.
 - The app has no authentication. Anyone using the same learner name on the same app can resume that lesson.
 - Scanned PDFs and image-only slides cannot be read; OCR and direct image input are not implemented.
 - Documents are split recursively at paragraph, sentence, and word boundaries, with overlap between adjacent chunks.
 - Hybrid retrieval combines BM25 exact-term search and embedding semantic search using RRF.
-- NeMo Guardrails checks use the configured Groq model and can add up to two model calls per agent call, increasing latency and token usage. The topic-review request uses its own safety validation and response schema instead of the generic NeMo input/output rails. If a NeMo check fails, the error appears in Observability and the app continues with its prompt-level safeguards; explicit safety blocks still stop other requests. Judge scores also add a Groq request per generated lesson segment.
+- NeMo Guardrails checks use the configured Groq model and can add up to two model calls per agent call, increasing latency and token usage. If a NeMo input/output check fails or the library is unavailable, generation stops and the failure appears in Observability. The topic-review request uses its own safety validation and response schema instead of the generic NeMo input/output rails. Judge scores also add a Groq request per generated lesson segment.
 - LLM-as-Judge scores are advisory, not ground truth. The exact Groq judge model ID must be enabled for your account.
 
 ## Project guide

@@ -5,11 +5,13 @@
 # =====================================================================
 import os, re, json, time, copy, random, sqlite3, html, math, uuid
 import shutil, subprocess, tempfile
+import logging
 from contextlib import contextmanager
 from io import BytesIO
 from typing import List, Optional, Literal
 
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
 from fastembed import TextEmbedding
 from groq import Groq, AuthenticationError
 from pydantic import BaseModel, Field, ValidationError
@@ -46,6 +48,16 @@ AI_GUARDRAILS = (
     "Allow safe, high-level educational, historical, preventive, and defensive discussion. If a request crosses these "
     "limits, refuse briefly and offer a safe learning alternative while preserving the required JSON structure."
 )
+
+
+def parse_guardrail_decision(response: str):
+    """NeMo output parsers return a one-item sequence; only a clear 'No' allows."""
+    decision = re.sub(r"[^a-z]", "", str(response).strip().lower())
+    if decision == "no":
+        return [True]
+    if decision == "yes":
+        return [False]
+    return [False]
 NUM_CONCEPTS = 3                      # how many concepts the Architect plans (+1 final challenge)
 MAX_ATTEMPTS_PER_CONCEPT = 8          # safety limit: the teaching loop can never run forever
 LESSON_LANGUAGE = "English"           # language of lessons, questions and feedback
@@ -53,7 +65,117 @@ CHUNK_SIZE = 1500                     # maximum characters per source-document c
 CHUNK_OVERLAP = 150                   # context carried over between adjacent chunks
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 RRF_K = 60
-DB_PATH = os.environ.get("DB_PATH", "tutor.db")            # SQLite file (on Streamlit Cloud it resets when the app restarts)
+LOGGER = logging.getLogger(__name__)
+DB_PATH = os.environ.get(
+    "DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tutor.db")
+)
+
+
+def langfuse_credentials():
+    try:
+        secrets = st.secrets
+        section = secrets.get("langfuse", {})
+        secret_public_key = str(secrets.get("LANGFUSE_PUBLIC_KEY", "") or section.get("public_key", "")).strip()
+        secret_secret_key = str(secrets.get("LANGFUSE_SECRET_KEY", "") or section.get("secret_key", "")).strip()
+        secret_base_url = str(secrets.get("LANGFUSE_BASE_URL", "") or section.get("base_url", "")).strip()
+    except StreamlitSecretNotFoundError:
+        secret_public_key = secret_secret_key = secret_base_url = ""
+    return (
+        os.environ.get("LANGFUSE_PUBLIC_KEY", "").strip()
+        or secret_public_key,
+        os.environ.get("LANGFUSE_SECRET_KEY", "").strip()
+        or secret_secret_key,
+        os.environ.get("LANGFUSE_BASE_URL", "").strip()
+        or secret_base_url
+        or "https://cloud.langfuse.com",
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def create_langfuse_client(public_key, secret_key, base_url):
+    from langfuse import Langfuse
+    return Langfuse(public_key=public_key, secret_key=secret_key, base_url=base_url)
+
+
+def get_langfuse_client():
+    public_key, secret_key, base_url = langfuse_credentials()
+    if not public_key or not secret_key:
+        return None
+    try:
+        return create_langfuse_client(public_key, secret_key, base_url)
+    except Exception:
+        LOGGER.exception("Langfuse client initialization failed; continuing without external tracing.")
+        return None
+
+
+def update_langfuse_observation(observation, **kwargs):
+    if observation is None:
+        return
+    try:
+        observation.update(**kwargs)
+    except Exception:
+        LOGGER.exception("Could not update Langfuse observation; continuing without this trace.")
+
+
+@contextmanager
+def langfuse_observation(client, **kwargs):
+    if client is None:
+        yield None
+        return
+    try:
+        manager = client.start_as_current_observation(**kwargs)
+        observation = manager.__enter__()
+    except Exception:
+        LOGGER.exception("Could not start Langfuse observation; continuing without this trace.")
+        yield None
+        return
+    try:
+        yield observation
+    except BaseException as error:
+        trace_error = RuntimeError(type(error).__name__)
+        try:
+            manager.__exit__(type(trace_error), trace_error, trace_error.__traceback__)
+        except Exception:
+            LOGGER.exception("Could not close Langfuse observation after an application error.")
+        raise
+    else:
+        try:
+            manager.__exit__(None, None, None)
+        except Exception:
+            LOGGER.exception("Could not close Langfuse observation; continuing without this trace.")
+
+
+def configured_database_url():
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if not url:
+        try:
+            secrets = st.secrets
+            url = str(secrets.get("SUPABASE_DB_URL", "") or secrets.get("DATABASE_URL", "")).strip()
+        except StreamlitSecretNotFoundError:
+            url = ""
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    return url
+
+
+class DatabaseConnection:
+    def __init__(self, connection, postgres=False):
+        self.connection = connection
+        self.postgres = postgres
+
+    def execute(self, statement, parameters=()):
+        if self.postgres:
+            statement = statement.replace("?", "%s")
+        return self.connection.execute(statement, parameters)
+
+    def commit(self):
+        self.connection.commit()
+
+    def rollback(self):
+        self.connection.rollback()
+
+    def close(self):
+        self.connection.close()
 
 # ---------------- ONE PLACE THAT TALKS TO THE LLM ----------------
 # Every agent calls ask_json(). To change the model/provider later, only this part changes.
@@ -139,47 +261,44 @@ def get_nemo_guardrails():
     })
     rails = LLMRails(config)
 
-    def parse_safety_decision(response: str):
-        cleaned = response.strip().lower()
-        words = re.sub(r"[^\w\s]", " ", cleaned).split()[:3]
-        if "yes" in words or "unsafe" in words or "block" in words:
-            return [False]
-        if "no" in words or "safe" in words or "allow" in words:
-            return [True]
-        return [True]
-
-    try:
-        rails.register_output_parser(parse_safety_decision, "self_check_input")
-        rails.register_output_parser(parse_safety_decision, "self_check_output")
-    except Exception:
-        pass
+    rails.register_output_parser(parse_guardrail_decision, "self_check_input")
+    rails.register_output_parser(parse_guardrail_decision, "self_check_output")
 
     st.session_state["_nemo_guardrails"] = (key, MODEL, rails)
     return rails
 
 
 def run_nemo_guardrail(S, direction, messages):
-    if not st.session_state.get("nemo_guardrails_enabled", True):
-        return {"allowed": True, "status": "DISABLED", "content": "", "rail": ""}
     if NEMO_IMPORT_ERROR:
-        return {"allowed": True, "status": "UNAVAILABLE", "content": "", "rail": ""}
+        record_guardrail_event(S, direction, "UNAVAILABLE", f"self check {direction}", 0, NEMO_IMPORT_ERROR)
+        return {"allowed": False, "status": "UNAVAILABLE", "content": "", "rail": "",
+                "error_type": NEMO_IMPORT_ERROR}
 
     started = time.perf_counter()
     try:
         rails = get_nemo_guardrails()
         rail_type = RailType.INPUT if direction == "input" else RailType.OUTPUT
-        result = rails.check(messages, rail_types=[rail_type])
-        status = str(getattr(result.status, "value", result.status)).upper().split(".")[-1]
-        if status not in ("PASSED", "MODIFIED", "BLOCKED"):
-            status = "ERROR"
-            error_type = "UnexpectedRailStatus"
-        else:
-            error_type = None
-        allowed = status != "BLOCKED"
-        rail_name = getattr(result, "rail", None) or f"self check {direction}"
-        record_guardrail_event(
-            S, direction, status, rail_name, (time.perf_counter() - started) * 1000, error_type,
-        )
+        with langfuse_observation(
+            get_langfuse_client(),
+            as_type="span",
+            name="guardrail-check",
+            metadata={"direction": direction},
+        ) as observation:
+            result = rails.check(messages, rail_types=[rail_type])
+            status = str(getattr(result.status, "value", result.status)).upper().split(".")[-1]
+            if status not in ("PASSED", "MODIFIED", "BLOCKED"):
+                status = "ERROR"
+                error_type = "UnexpectedRailStatus"
+            else:
+                error_type = None
+            allowed = status in ("PASSED", "MODIFIED")
+            rail_name = getattr(result, "rail", None) or f"self check {direction}"
+            latency_ms = (time.perf_counter() - started) * 1000
+            record_guardrail_event(S, direction, status, rail_name, latency_ms, error_type)
+            update_langfuse_observation(
+                observation,
+                metadata={"direction": direction, "status": status, "latency_ms": round(latency_ms, 1)},
+            )
         return {
             "allowed": allowed,
             "status": status,
@@ -191,7 +310,8 @@ def run_nemo_guardrail(S, direction, messages):
             S, direction, "ERROR", f"self check {direction}",
             (time.perf_counter() - started) * 1000, type(e).__name__,
         )
-        return {"allowed": True, "status": "ERROR", "content": "", "rail": "", "error_type": type(e).__name__}
+        return {"allowed": False, "status": "ERROR", "content": "", "rail": "",
+                "error_type": type(e).__name__}
 
 
 def parse_json_text(text):
@@ -206,10 +326,51 @@ class GuardrailsBlockedError(RuntimeError):
     pass
 
 
+class GuardrailsUnavailableError(RuntimeError):
+    pass
+
+
 def ask_json(system_prompt, user_prompt, usage_state, temperature=0.3, retries=3,
              agent="Agent", model_name=None, check_input_rail=True, check_output_rail=True):
-    # Ask the model and return a Python dict. Retries on rate limits (429) and bad JSON.
     selected_model = model_name or MODEL
+    langfuse_client = get_langfuse_client()
+    metadata = {"agent": agent, "model": selected_model}
+    try:
+        with langfuse_observation(
+            langfuse_client,
+            as_type="span",
+            name="agent-call",
+            metadata=metadata,
+        ) as span:
+            run_id = usage_state.get("run_id")
+            if langfuse_client and run_id:
+                from langfuse import propagate_attributes
+                with propagate_attributes(session_id=run_id):
+                    result = _ask_json(
+                        system_prompt, user_prompt, usage_state, temperature, retries, agent,
+                        selected_model, check_input_rail, check_output_rail, langfuse_client,
+                    )
+            elif langfuse_client:
+                result = _ask_json(
+                    system_prompt, user_prompt, usage_state, temperature, retries, agent,
+                    selected_model, check_input_rail, check_output_rail, langfuse_client,
+                )
+            else:
+                result = _ask_json(
+                    system_prompt, user_prompt, usage_state, temperature, retries, agent,
+                    selected_model, check_input_rail, check_output_rail,
+                )
+            update_langfuse_observation(span, metadata={**metadata, "status": "success"})
+            return result
+    except Exception as error:
+        if langfuse_client:
+            LOGGER.warning("An agent call failed while Langfuse tracing was enabled: %s", type(error).__name__)
+        raise
+
+
+def _ask_json(system_prompt, user_prompt, usage_state, temperature, retries,
+              agent, selected_model, check_input_rail, check_output_rail, langfuse_client=None):
+    # Ask the model and return a Python dict. Retries on rate limits (429) and bad JSON.
     started = time.perf_counter()
     attempts = 0
     input_tokens = output_tokens = 0
@@ -223,6 +384,12 @@ def ask_json(system_prompt, user_prompt, usage_state, temperature=0.3, retries=3
             usage_state, "input", [{"role": "user", "content": user_prompt}],
         )
         if not input_rail["allowed"]:
+            if input_rail["status"] in ("ERROR", "UNAVAILABLE"):
+                record_agent_event(usage_state, agent, selected_model, "error", 0, 0, 0, 0,
+                                   f"NeMoInput{input_rail['status'].title()}")
+                raise GuardrailsUnavailableError(
+                    "NeMo input safety check could not run. Check the API key and Guardrail Decision Log, then retry."
+                )
             record_agent_event(usage_state, agent, selected_model, "blocked", 0, 0, 0, 0, "NeMoInputRail")
             raise GuardrailsBlockedError("NeMo Guardrails blocked this request.")
         if input_rail.get("content") and input_rail["status"] == "MODIFIED":
@@ -242,11 +409,21 @@ def ask_json(system_prompt, user_prompt, usage_state, temperature=0.3, retries=3
             )
             if use_json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
-            reply = client.chat.completions.create(**kwargs)
-            response_text = reply.choices[0].message.content or ""
-            track_token_usage(usage_state, reply.usage, len(response_text))
-            input_tokens += int(getattr(reply.usage, "prompt_tokens", 0) or 0) if reply.usage else 0
-            output_tokens += int(getattr(reply.usage, "completion_tokens", 0) or 0) if reply.usage else 0
+            with langfuse_observation(
+                langfuse_client,
+                as_type="generation",
+                name="groq-chat-completion",
+                model=selected_model,
+            ) as generation:
+                reply = client.chat.completions.create(**kwargs)
+                response_text = reply.choices[0].message.content or ""
+                track_token_usage(usage_state, reply.usage, len(response_text))
+                call_input_tokens = int(getattr(reply.usage, "prompt_tokens", 0) or 0) if reply.usage else 0
+                call_output_tokens = int(getattr(reply.usage, "completion_tokens", 0) or 0) if reply.usage else 0
+                input_tokens += call_input_tokens
+                output_tokens += call_output_tokens
+                if generation:
+                    generation.update(usage_details={"input": call_input_tokens, "output": call_output_tokens})
             if check_output_rail:
                 output_rail = run_nemo_guardrail(
                     usage_state, "output", [
@@ -255,6 +432,15 @@ def ask_json(system_prompt, user_prompt, usage_state, temperature=0.3, retries=3
                     ],
                 )
                 if not output_rail["allowed"]:
+                    if output_rail["status"] in ("ERROR", "UNAVAILABLE"):
+                        record_agent_event(
+                            usage_state, agent, selected_model, "error", attempts,
+                            (time.perf_counter() - started) * 1000, input_tokens, output_tokens,
+                            f"NeMoOutput{output_rail['status'].title()}",
+                        )
+                        raise GuardrailsUnavailableError(
+                            "NeMo output safety check could not run. The response was not shown; check Observability and retry."
+                        )
                     record_agent_event(
                         usage_state, agent, selected_model, "blocked", attempts,
                         (time.perf_counter() - started) * 1000, input_tokens, output_tokens, "NeMoOutputRail",
@@ -274,7 +460,7 @@ def ask_json(system_prompt, user_prompt, usage_state, temperature=0.3, retries=3
                 (time.perf_counter() - started) * 1000, input_tokens, output_tokens, "AuthenticationError",
             )
             raise RuntimeError("Groq rejected this API key. Check the key in the sidebar and try again.")
-        except GuardrailsBlockedError:
+        except (GuardrailsBlockedError, GuardrailsUnavailableError):
             raise
         except Exception as e:                       # rate limit, network, or bad JSON
             last_error = e
@@ -404,16 +590,27 @@ def shuffle_options(q):
     q.correct_index = q.options.index(right)
     return q
 
-# ---------------- SQLITE DATABASE (progress is saved after every step) ----------------
+# ---------------- DATABASE (progress is saved after every step) ----------------
 @contextmanager
 def db():
-    folder = os.path.dirname(DB_PATH)
-    if folder:
-        os.makedirs(folder, exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
+    database_url = configured_database_url()
+    if database_url:
+        try:
+            import psycopg
+        except ImportError as e:
+            raise RuntimeError("Install psycopg to use the configured PostgreSQL database.") from e
+        con = DatabaseConnection(psycopg.connect(database_url), postgres=True)
+    else:
+        folder = os.path.dirname(DB_PATH)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        con = DatabaseConnection(sqlite3.connect(DB_PATH))
     try:
         yield con
         con.commit()
+    except Exception:
+        con.rollback()
+        raise
     finally:
         con.close()
 
@@ -422,62 +619,85 @@ def init_db():
     # sessions = the full lesson state of each learner (so they can resume)
     # answers  = one row per answered question (useful for analytics later)
     with db() as con:
+        id_type = "BIGSERIAL PRIMARY KEY" if con.postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
         con.execute("CREATE TABLE IF NOT EXISTS sessions "
-                    "(learner TEXT PRIMARY KEY, state_json TEXT, updated REAL)")
-        con.execute("CREATE TABLE IF NOT EXISTS answers "
-                    "(id INTEGER PRIMARY KEY AUTOINCREMENT, learner TEXT, topic TEXT, concept TEXT, "
-                    "kind TEXT, question TEXT, answer TEXT, result TEXT, created REAL)")
-        con.execute("CREATE TABLE IF NOT EXISTS agent_events "
-                    "(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, agent TEXT, model TEXT, status TEXT, "
-                    "attempts INTEGER, latency_ms REAL, input_tokens INTEGER, output_tokens INTEGER, "
-                    "error_type TEXT, created REAL)")
-        con.execute("CREATE TABLE IF NOT EXISTS quality_judgments "
-                    "(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, output_number INTEGER, model TEXT, "
+                    "(learner TEXT PRIMARY KEY, state_json TEXT, updated DOUBLE PRECISION)")
+        con.execute(f"CREATE TABLE IF NOT EXISTS answers "
+                    f"(id {id_type}, learner TEXT, topic TEXT, concept TEXT, "
+                    "kind TEXT, question TEXT, answer TEXT, result TEXT, created DOUBLE PRECISION)")
+        con.execute(f"CREATE TABLE IF NOT EXISTS agent_events "
+                    f"(id {id_type}, run_id TEXT, agent TEXT, model TEXT, status TEXT, "
+                    "attempts INTEGER, latency_ms DOUBLE PRECISION, input_tokens INTEGER, output_tokens INTEGER, "
+                    "error_type TEXT, created DOUBLE PRECISION)")
+        con.execute(f"CREATE TABLE IF NOT EXISTS quality_judgments "
+                    f"(id {id_type}, run_id TEXT, output_number INTEGER, model TEXT, "
                     "status TEXT, overall INTEGER, accuracy INTEGER, relevance INTEGER, clarity INTEGER, "
-                    "learner_fit INTEGER, safety INTEGER, error_type TEXT, created REAL)")
-        con.execute("CREATE TABLE IF NOT EXISTS rag_evaluations "
-                "(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, k INTEGER, relevant_count INTEGER, "
-                "retrieved_count INTEGER, hit_count INTEGER, precision_at_k REAL, recall_at_k REAL, "
-                "query TEXT, eval_type TEXT, created REAL)")
-        for col, ctype in [("query", "TEXT"), ("eval_type", "TEXT")]:
-            try:
-                con.execute(f"ALTER TABLE rag_evaluations ADD COLUMN {col} {ctype}")
-            except sqlite3.OperationalError:
-                pass
-        con.execute("CREATE TABLE IF NOT EXISTS guardrail_events "
-                "(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, direction TEXT, status TEXT, "
-                "rail_name TEXT, latency_ms REAL, model TEXT, error_type TEXT, created REAL)")
+                    "learner_fit INTEGER, safety INTEGER, error_type TEXT, created DOUBLE PRECISION)")
+        con.execute(f"CREATE TABLE IF NOT EXISTS rag_evaluations "
+                    f"(id {id_type}, run_id TEXT, k INTEGER, relevant_count INTEGER, "
+                    "retrieved_count INTEGER, hit_count INTEGER, precision_at_k DOUBLE PRECISION, "
+                    "recall_at_k DOUBLE PRECISION, query TEXT, eval_type TEXT, created DOUBLE PRECISION)")
+        if not con.postgres:
+            for col, ctype in [("query", "TEXT"), ("eval_type", "TEXT")]:
+                try:
+                    con.execute(f"ALTER TABLE rag_evaluations ADD COLUMN {col} {ctype}")
+                except sqlite3.OperationalError:
+                    pass
+        con.execute(f"CREATE TABLE IF NOT EXISTS guardrail_events "
+                    f"(id {id_type}, run_id TEXT, direction TEXT, status TEXT, "
+                    "rail_name TEXT, latency_ms DOUBLE PRECISION, model TEXT, error_type TEXT, "
+                    "created DOUBLE PRECISION)")
+        # Episodic memory stores one concise, inspectable record per learner answer.
+        con.execute(f"CREATE TABLE IF NOT EXISTS episode_memory "
+                    f"(id {id_type}, learner TEXT, run_id TEXT, topic TEXT, concept TEXT, "
+                    "question TEXT, answer TEXT, result TEXT, teaching_method TEXT, "
+                    "next_action TEXT, created DOUBLE PRECISION)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_episode_memory_learner_created "
+                    "ON episode_memory (learner, created)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_episode_memory_run_id ON episode_memory (run_id)")
+        con.execute("CREATE TABLE IF NOT EXISTS procedural_memory "
+                    "(learner TEXT, learner_level TEXT, strategy TEXT, attempts INTEGER, "
+                    "correct_count INTEGER, partial_count INTEGER, unsuccessful_count INTEGER, "
+                    "updated DOUBLE PRECISION, PRIMARY KEY (learner, learner_level, strategy))")
+        # Make the already-saved answer history visible as episodes too. Older records
+        # did not retain the method/action, so label those fields instead of guessing.
+        con.execute(
+            "INSERT INTO episode_memory "
+            "(learner, run_id, topic, concept, question, answer, result, teaching_method, next_action, created) "
+            "SELECT a.learner, 'legacy-answer-' || CAST(a.id AS TEXT), COALESCE(a.topic, ''), "
+            "COALESCE(a.concept, ''), COALESCE(a.question, ''), COALESCE(a.answer, ''), "
+            "CASE WHEN a.result = 'wrong' AND a.answer = '(I don''t know)' THEN 'skipped' ELSE COALESCE(a.result, '') END, "
+            "'Not recorded (existing history)', 'Not recorded (existing history)', a.created "
+            "FROM answers a WHERE NOT EXISTS (SELECT 1 FROM episode_memory e "
+            "WHERE e.run_id = 'legacy-answer-' || CAST(a.id AS TEXT))"
+        )
+        for table in ("agent_events", "quality_judgments", "rag_evaluations", "guardrail_events"):
+            con.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_run_id_id ON {table} (run_id, id)")
 
 
 def record_agent_event(S, agent, model, status, attempts, latency_ms,
                        input_tokens, output_tokens, error_type=None):
     run_id = S.setdefault("run_id", uuid.uuid4().hex)
-    try:
-        with db() as con:
-            con.execute(
-                "INSERT INTO agent_events "
-                "(run_id, agent, model, status, attempts, latency_ms, input_tokens, output_tokens, error_type, created) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (run_id, agent, model, status, attempts, round(latency_ms, 1), input_tokens,
-                 output_tokens, error_type, time.time()),
-            )
-    except sqlite3.Error:
-        pass
+    with db() as con:
+        con.execute(
+            "INSERT INTO agent_events "
+            "(run_id, agent, model, status, attempts, latency_ms, input_tokens, output_tokens, error_type, created) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (run_id, agent, model, status, attempts, round(latency_ms, 1), input_tokens,
+             output_tokens, error_type, time.time()),
+        )
 
 
 def record_guardrail_event(S, direction, status, rail_name, latency_ms, error_type=None):
     run_id = S.setdefault("run_id", uuid.uuid4().hex)
-    try:
-        with db() as con:
-            con.execute(
-                "INSERT INTO guardrail_events "
-                "(run_id, direction, status, rail_name, latency_ms, model, error_type, created) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (run_id, direction, status, rail_name, round(latency_ms, 1), MODEL,
-                 error_type, time.time()),
-            )
-    except sqlite3.Error:
-        pass
+    with db() as con:
+        con.execute(
+            "INSERT INTO guardrail_events "
+            "(run_id, direction, status, rail_name, latency_ms, model, error_type, created) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (run_id, direction, status, rail_name, round(latency_ms, 1), MODEL,
+             error_type, time.time()),
+        )
 
 
 def _json_safe(obj):
@@ -503,7 +723,9 @@ def save_progress(S):
     if not S.get("learner"):
         return
     with db() as con:
-        con.execute("INSERT OR REPLACE INTO sessions VALUES (?, ?, ?)",
+        con.execute("INSERT INTO sessions (learner, state_json, updated) VALUES (?, ?, ?) "
+                    "ON CONFLICT(learner) DO UPDATE SET "
+                    "state_json = excluded.state_json, updated = excluded.updated",
                     (S["learner"], json.dumps(_json_safe(S)), time.time()))
 
 
@@ -521,6 +743,96 @@ def log_answer(S, concept, q, answer, result):
                      "skipped" if result == "skipped" else result, time.time()))
 
 
+def record_episode(S, concept, q, answer, result, next_action):
+    """Persist the learning event that can help the tutor adapt next time."""
+    method = S.get("content", {}).get("method", "")
+    style = S.get("content", {}).get("teaching_style", "")
+    strategy = f"change_style:{style}" if method == "change_style" else method
+    learner_level = (S.get("profile") or {}).get("level", "not set")
+    correct_count = int(result == "correct")
+    partial_count = int(result == "partial")
+    unsuccessful_count = int(result in ("wrong", "skipped", "unclear"))
+    with db() as con:
+        con.execute(
+            "INSERT INTO episode_memory "
+            "(learner, run_id, topic, concept, question, answer, result, teaching_method, next_action, created) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (S["learner"], S.get("run_id"), S.get("topic", ""), concept, q.get("text", "")[:1000],
+             str(answer)[:500], result, strategy, next_action, time.time()),
+        )
+        con.execute(
+            "INSERT INTO procedural_memory "
+            "(learner, learner_level, strategy, attempts, correct_count, partial_count, unsuccessful_count, updated) "
+            "VALUES (?, ?, ?, 1, ?, ?, ?, ?) "
+            "ON CONFLICT (learner, learner_level, strategy) DO UPDATE SET "
+            "attempts = procedural_memory.attempts + 1, "
+            "correct_count = procedural_memory.correct_count + excluded.correct_count, "
+            "partial_count = procedural_memory.partial_count + excluded.partial_count, "
+            "unsuccessful_count = procedural_memory.unsuccessful_count + excluded.unsuccessful_count, "
+            "updated = excluded.updated",
+            (S["learner"], learner_level, strategy, correct_count, partial_count, unsuccessful_count, time.time()),
+        )
+
+
+def load_episode_memory(learner=None):
+    with db() as con:
+        if learner:
+            rows = con.execute(
+                "SELECT id, run_id, learner, topic, concept, question, answer, result, teaching_method, next_action, created "
+                "FROM episode_memory WHERE learner = ? ORDER BY created DESC, id DESC", (learner,)
+            ).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT id, run_id, learner, topic, concept, question, answer, result, teaching_method, next_action, created "
+                "FROM episode_memory ORDER BY created DESC, id DESC"
+            ).fetchall()
+        learners = con.execute("SELECT DISTINCT learner FROM episode_memory ORDER BY learner").fetchall()
+    return rows, [row[0] for row in learners]
+
+
+def load_prior_episodes(learner, topic, limit=8):
+    """Return only instructional metadata from recent episodes on this topic."""
+    if not learner or not topic:
+        return []
+    with db() as con:
+        rows = con.execute(
+            "SELECT concept, result, teaching_method, next_action FROM episode_memory "
+            "WHERE learner = ? AND LOWER(topic) = LOWER(?) "
+            "AND teaching_method <> 'Not recorded (existing history)' "
+            "ORDER BY created DESC, id DESC LIMIT ?", (learner, topic, limit)
+        ).fetchall()
+    return [{"concept": row[0], "result": row[1], "method": row[2], "next_action": row[3]} for row in rows]
+
+
+def load_procedural_memory(learner=None):
+    with db() as con:
+        if learner:
+            rows = con.execute(
+                "SELECT learner, learner_level, strategy, attempts, correct_count, partial_count, "
+                "unsuccessful_count, updated FROM procedural_memory WHERE learner = ? "
+                "ORDER BY learner_level, strategy", (learner,)
+            ).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT learner, learner_level, strategy, attempts, correct_count, partial_count, "
+                "unsuccessful_count, updated FROM procedural_memory ORDER BY learner, learner_level, strategy"
+            ).fetchall()
+        learners = con.execute("SELECT DISTINCT learner FROM procedural_memory ORDER BY learner").fetchall()
+    return rows, [row[0] for row in learners]
+
+
+def load_style_outcomes(learner, learner_level):
+    strategies = [f"change_style:{style}" for style in STYLE_IDEAS]
+    placeholders = ", ".join("?" for _ in strategies)
+    with db() as con:
+        rows = con.execute(
+            "SELECT strategy, attempts, correct_count FROM procedural_memory "
+            f"WHERE learner = ? AND learner_level = ? AND strategy IN ({placeholders})",
+            (learner, learner_level, *strategies),
+        ).fetchall()
+    return {row[0].split(":", 1)[1]: {"attempts": row[1], "correct": row[2]} for row in rows}
+
+
 def load_profile_activity():
     with db() as con:
         profiles = con.execute(
@@ -534,40 +846,39 @@ def load_profile_activity():
     return profiles, answers
 
 
-def load_observability_data(limit=500):
+def load_observability_data(limit=500, run_id=None):
+    run_filter = " WHERE run_id = ?" if run_id else ""
+    parameters = (run_id, limit) if run_id else (limit,)
     with db() as con:
         events = con.execute(
             "SELECT run_id, agent, model, status, attempts, latency_ms, input_tokens, output_tokens, error_type, created "
-            "FROM agent_events ORDER BY id DESC LIMIT ?", (limit,)
+            f"FROM agent_events{run_filter} ORDER BY id DESC LIMIT ?", parameters
         ).fetchall()
         judgments = con.execute(
             "SELECT run_id, output_number, model, status, overall, accuracy, relevance, clarity, learner_fit, safety, "
-            "error_type, created FROM quality_judgments ORDER BY id DESC LIMIT ?", (limit,)
+            f"error_type, created FROM quality_judgments{run_filter} ORDER BY id DESC LIMIT ?", parameters
         ).fetchall()
         rag_evaluations = con.execute(
             "SELECT run_id, k, relevant_count, retrieved_count, hit_count, precision_at_k, recall_at_k, created, "
-            "COALESCE(query, ''), COALESCE(eval_type, 'manual') "
-            "FROM rag_evaluations ORDER BY id DESC LIMIT ?", (limit,)
+            f"COALESCE(query, ''), COALESCE(eval_type, 'manual') FROM rag_evaluations{run_filter} "
+            "ORDER BY id DESC LIMIT ?", parameters
         ).fetchall()
         guardrail_events = con.execute(
             "SELECT run_id, direction, status, rail_name, latency_ms, model, error_type, created "
-            "FROM guardrail_events ORDER BY id DESC LIMIT ?", (limit,)
+            f"FROM guardrail_events{run_filter} ORDER BY id DESC LIMIT ?", parameters
         ).fetchall()
     return events, judgments, rag_evaluations, guardrail_events
 
 
 def save_rag_evaluation(S, k, relevant_count, retrieved_count, hit_count, precision, recall, query="", eval_type="auto"):
     run_id = (S.get("run_id") if S else None) or uuid.uuid4().hex
-    try:
-        with db() as con:
-            con.execute(
-                "INSERT INTO rag_evaluations "
-                "(run_id, k, relevant_count, retrieved_count, hit_count, precision_at_k, recall_at_k, query, eval_type, created) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (run_id, k, relevant_count, retrieved_count, hit_count, precision, recall, str(query)[:300], str(eval_type), time.time()),
-            )
-    except sqlite3.Error:
-        pass
+    with db() as con:
+        con.execute(
+            "INSERT INTO rag_evaluations "
+            "(run_id, k, relevant_count, retrieved_count, hit_count, precision_at_k, recall_at_k, query, eval_type, created) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (run_id, k, relevant_count, retrieved_count, hit_count, precision, recall, str(query)[:300], str(eval_type), time.time()),
+        )
 
 
 def delete_learner(learner):
@@ -575,6 +886,8 @@ def delete_learner(learner):
     with db() as con:
         con.execute("DELETE FROM sessions WHERE learner = ?", (learner,))
         con.execute("DELETE FROM answers WHERE learner = ?", (learner,))
+        con.execute("DELETE FROM episode_memory WHERE learner = ?", (learner,))
+        con.execute("DELETE FROM procedural_memory WHERE learner = ?", (learner,))
 
 # ---------------- SOURCE DOCUMENT READING AND SIMPLE RETRIEVAL ----------------
 def read_pdf(file_bytes, filename="notes.pdf"):
@@ -998,15 +1311,33 @@ def auto_evaluate_rag_retrieval(S, material, query, k=2, concept_title="", preco
 
 
 def retrieve_and_evaluate_chunks(S, material, query, k=2, concept_title=""):
-    ranked = rank_chunks(material, query, usage_state=S)
-    top_k = ranked[:k]
-    source_text = "\n---\n".join(material["chunks"][row["index"]] for row in top_k)
-    eval_data = None
-    try:
-        eval_data = auto_evaluate_rag_retrieval(S, material, query, k=k, concept_title=concept_title, precomputed_ranked=ranked, eval_type="auto_lesson")
-    except Exception:
-        pass
-    return source_text, eval_data
+    with langfuse_observation(
+        get_langfuse_client(),
+        as_type="span",
+        name="rag-retrieval",
+        metadata={"top_k": k},
+    ) as observation:
+        ranked = rank_chunks(material, query, usage_state=S)
+        top_k = ranked[:k]
+        source_text = "\n---\n".join(material["chunks"][row["index"]] for row in top_k)
+        eval_data = None
+        try:
+            eval_data = auto_evaluate_rag_retrieval(
+                S, material, query, k=k, concept_title=concept_title,
+                precomputed_ranked=ranked, eval_type="auto_lesson",
+            )
+        except Exception:
+            pass
+        update_langfuse_observation(
+            observation,
+            metadata={
+                "top_k": k,
+                "retrieved_count": len(top_k),
+                "precision_at_k": eval_data.get("precision") if eval_data else None,
+                "recall_at_k": eval_data.get("recall") if eval_data else None,
+            },
+        )
+        return source_text, eval_data
 
 
 def suggest_document_query(material):
@@ -1237,6 +1568,16 @@ def write_concept(S, concept, method, kind, extra="", style=""):
         user += "Concepts taught in this lesson: " + "; ".join(c["title"] for c in S["plan"]) + "\n"
     if extra:
         user += f"What we know about the learner's problem: {extra}\n"
+    prior_episodes = S.get("prior_episodes", [])
+    if prior_episodes and method in ("first_time", "final"):
+        episode_notes = "; ".join(
+            f"{item['concept']}: {item['result']} after {item['method']} (next action: {item['next_action']})"
+            for item in prior_episodes[:8]
+        )
+        user += (
+            "Prior same-topic episode metadata (historical signals, not permanent traits): "
+            + episode_notes + "\nUse this only to build on demonstrated success and avoid approaches that did not help.\n"
+        )
     earlier = S["asked"].get(concept["title"], [])
     if earlier:
         user += "Questions already asked (do NOT repeat them): " + " | ".join(earlier) + "\n"
@@ -1267,18 +1608,15 @@ def save_quality_judgment(S, output_number, model, result=None, error_type=None)
     run_id = S.setdefault("run_id", uuid.uuid4().hex)
     status = "success" if result else "error"
     values = result or {}
-    try:
-        with db() as con:
-            con.execute(
-                "INSERT INTO quality_judgments "
-                "(run_id, output_number, model, status, overall, accuracy, relevance, clarity, learner_fit, safety, error_type, created) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (run_id, output_number, model, status, values.get("overall"), values.get("accuracy"),
-                 values.get("relevance"), values.get("clarity"), values.get("learner_fit"),
-                 values.get("safety"), error_type, time.time()),
-            )
-    except sqlite3.Error:
-        pass
+    with db() as con:
+        con.execute(
+            "INSERT INTO quality_judgments "
+            "(run_id, output_number, model, status, overall, accuracy, relevance, clarity, learner_fit, safety, error_type, created) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (run_id, output_number, model, status, values.get("overall"), values.get("accuracy"),
+             values.get("relevance"), values.get("clarity"), values.get("learner_fit"),
+             values.get("safety"), error_type, time.time()),
+        )
     if result:
         S.setdefault("quality_judgments", []).append({
             "output_number": output_number,
@@ -1453,10 +1791,17 @@ def pick_kind(S, method):
 
 
 def pick_style(S):
-    # Rotate the teaching style so we never repeat the same explanation
-    title = current_concept(S)["title"]
-    n = sum(1 for m in S["methods_tried"] if m["concept"] == title and m["method"] == "change_style")
-    return STYLE_IDEAS[n % len(STYLE_IDEAS)]
+    # Explore styles evenly until there is enough evidence, then prefer the best
+    # observed style for this learner and level.
+    profile = S.get("profile") or {}
+    outcomes = load_style_outcomes(S.get("learner"), profile.get("level", "not set"))
+    stats = {style: outcomes.get(style, {"attempts": 0, "correct": 0}) for style in STYLE_IDEAS}
+    if all(stats[style]["attempts"] >= 2 for style in STYLE_IDEAS):
+        best_rate = max(stats[style]["correct"] / stats[style]["attempts"] for style in STYLE_IDEAS)
+        tied = [style for style in STYLE_IDEAS
+                if stats[style]["correct"] / stats[style]["attempts"] == best_rate]
+        return min(tied, key=lambda style: (stats[style]["attempts"], STYLE_IDEAS.index(style)))
+    return min(STYLE_IDEAS, key=lambda style: (stats[style]["attempts"], STYLE_IDEAS.index(style)))
 
 
 def generate_content(S, method, extra="", style=""):
@@ -1471,6 +1816,7 @@ def generate_content(S, method, extra="", style=""):
     if st.session_state.get("enable_llm_judge", True):
         content["quality_judgment"] = judge_concept_quality(S, concept, content, S["qcount"] + 1)
     content["method"] = method
+    content["teaching_style"] = style or (S.get("profile") or {}).get("style", "")
     S["content"], S["phase"] = content, "question"
     S["qcount"] += 1
     S["methods_tried"].append({"concept": concept["title"], "method": method})
@@ -1482,6 +1828,7 @@ def begin_lesson(T):
     # Architect makes the plan, Content agent writes the first part. T is a working copy.
     keep = ("learner", "topic", "material", "profile", "quiz", "token_usage")
     T.update({k: v for k, v in new_state().items() if k not in keep})
+    T["prior_episodes"] = load_prior_episodes(T.get("learner"), T.get("topic"))
     T["plan"] = make_lesson_plan(T)
     T["log"].append(f"Architect planned {len(T['plan'])} concepts")
     generate_content(T, "first_time")
@@ -1521,6 +1868,7 @@ def process_answer(S, answer, skipped=False):
     S["history"].append({"concept": concept["title"], "method": S["content"]["method"], "kind": q["kind"],
                          "answer": str(shown)[:200], "result": "skipped" if ev["skipped"] else ev["result"]})
     log_answer(S, concept["title"], q, shown, "skipped" if ev["skipped"] else ev["result"])
+    record_episode(S, concept["title"], q, shown, "skipped" if ev["skipped"] else ev["result"], action)
     S["log"].append(f"Evaluator: {ev['result']}  ->  Orchestrator: {action}")
     S["last_eval"], S["action"], S["phase"] = ev, action, "feedback"
     save_progress(S)
@@ -1806,6 +2154,9 @@ def run_with_spinner(message, fn, *args):
         with st.spinner(message):
             fn(*args)
         return True
+    except GuardrailsUnavailableError as e:
+        st.error(f"Safety check unavailable: {e}")
+        return False
     except GuardrailsBlockedError as e:
         st.error(f"Safety check: {e}\n\nPlease choose a safe educational topic or rephrase your answer.")
         return False
@@ -1841,6 +2192,12 @@ def sidebar(S):
             st.rerun()
         if st.button("Profiles & activity", key="nav_profiles", use_container_width=True):
             st.session_state["app_view"] = "dashboard"
+            st.rerun()
+        if st.button("Episodic memory", key="nav_memory", use_container_width=True):
+            st.session_state["app_view"] = "memory"
+            st.rerun()
+        if st.button("Procedural memory", key="nav_procedural_memory", use_container_width=True):
+            st.session_state["app_view"] = "procedural_memory"
             st.rerun()
         if st.button("Observability", key="nav_observability", use_container_width=True):
             st.session_state["app_view"] = "observability"
@@ -2262,6 +2619,16 @@ def resolve_observability_session(S, saved_states):
 
 def screen_observability(S):
     page_head("Observability & Safety", "Inspect RAG pipeline health, AI safety guardrails, agent traces, and judge assessments.")
+    langfuse_public_key, langfuse_secret_key, _ = langfuse_credentials()
+    if langfuse_public_key and langfuse_secret_key:
+        st.success("Langfuse tracing is configured. Prompts, responses, and learner/document content are not sent.")
+    else:
+        st.info("Langfuse tracing is disabled. Configure `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` to enable it.")
+    if not configured_database_url():
+        st.info(
+            "Using local SQLite storage. On Streamlit Community Cloud, data can be lost when the app restarts. "
+            "Configure the `SUPABASE_DB_URL` secret to use persistent PostgreSQL storage."
+        )
 
     # 1. Conversation & Lesson Run Selector
     with db() as con:
@@ -2317,7 +2684,7 @@ def screen_observability(S):
     )
 
     selected_run_id, selected_state = run_options[selected_option]
-    active_S = selected_state if selected_state is not None else S
+    active_S = selected_state if selected_state is not None else live_S
     active_material = active_S.get("material") or {}
     active_source = active_S.get("source_file_name") or active_material.get("name") or "Not uploaded"
     active_topic = active_S.get("topic") or ""
@@ -2349,18 +2716,9 @@ def screen_observability(S):
         st.warning(f"Topic check is incomplete: {active_S['topic_check_error']}")
 
     # 2. Filter Telemetry by Selected Conversation
-    all_events, all_judgments, all_rag_evals, all_guardrails = load_observability_data()
-
-    if selected_run_id:
-        events = [row for row in all_events if row[0] == selected_run_id]
-        judgments = [row for row in all_judgments if row[0] == selected_run_id]
-        rag_evaluations = [row for row in all_rag_evals if row[0] == selected_run_id]
-        guardrail_events = [row for row in all_guardrails if row[0] == selected_run_id]
-    else:
-        events = all_events
-        judgments = all_judgments
-        rag_evaluations = all_rag_evals
-        guardrail_events = all_guardrails
+    events, judgments, rag_evaluations, guardrail_events = load_observability_data(
+        run_id=selected_run_id
+    )
 
     # 3. High-Level Metrics
     successful_events = [row for row in events if row[3] == "success"]
@@ -2368,7 +2726,7 @@ def screen_observability(S):
     blocked_guardrails = [row for row in guardrail_events if row[2] == "BLOCKED"]
     passed_guardrails = [row for row in guardrail_events if row[2] == "PASSED"]
 
-    live_rag = active_S.get("rag_retrievals", []) if active_S else []
+    live_rag = active_S.get("rag_retrievals", []) if selected_run_id and active_S else []
     if live_rag:
         avg_precision = sum(r["precision"] for r in live_rag) / len(live_rag)
         avg_recall = sum(r["recall"] for r in live_rag) / len(live_rag)
@@ -2491,20 +2849,20 @@ def screen_observability(S):
     # ---------------- TAB 2: AI GUARDRAILS & SAFETY ----------------
     with tab_guard:
         st.subheader("AI Safety & NeMo Guardrails")
-        st.caption("Active safety rails ensuring all student requests and generated teaching content respect safety and trust boundaries.")
+        st.caption("LLM-based input and output checks run before requests and responses are used. A check failure stops generation.")
 
         g_col1, g_col2 = st.columns([2, 1])
         with g_col1:
-            st.checkbox(
-                "Enable NeMo input/output rails",
-                value=True,
-                key="nemo_guardrails_enabled",
-                disabled=bool(NEMO_IMPORT_ERROR),
-            )
             if NEMO_IMPORT_ERROR:
-                st.warning(f"NeMo Guardrails library unavailable ({NEMO_IMPORT_ERROR}). Prompt-level trust boundaries remain active.")
+                st.error(f"NeMo Guardrails library unavailable ({NEMO_IMPORT_ERROR}). AI requests stop until the library is available.")
+            elif not current_key():
+                st.warning("NeMo is installed but not initialized. Add a Groq API key before safety checks can run.")
+            elif (st.session_state.get("_nemo_guardrails")
+                  and st.session_state["_nemo_guardrails"][0] == current_key()
+                  and st.session_state["_nemo_guardrails"][1] == MODEL):
+                st.success("NeMo rails initialized for this session. Any failed check stops generation.")
             else:
-                st.success("🟢 NeMo input & output self-check rails are active and protecting this conversation.")
+                st.info("NeMo is installed. Its input/output rails initialize on the first model request; status is not confirmed yet.")
         with g_col2:
             st.metric("Total Safety Checks", len(guardrail_events), f"{len(blocked_guardrails)} blocked" if blocked_guardrails else "0 violations")
 
@@ -2615,6 +2973,135 @@ def screen_observability(S):
         else:
             st.info("Quality judgment scores will appear after lesson content is generated.")
 
+
+
+def screen_memory(S):
+    page_head("Episodic memory", "Inspect the learning events the tutor has saved.")
+    show_warning(
+        "Memory is stored in the app database and is visible to app visitors. "
+        "Do not use private or sensitive learner information. Use ‘Delete my saved data’ in the sidebar to erase a learner’s records."
+    )
+    rows, learners = load_episode_memory()
+    if not rows:
+        st.info("No learning episodes have been saved yet. Submit an answer during a lesson and it will appear here.")
+        st.caption("Each episode records the learner, topic, concept, question, submitted answer, result, teaching method, next action, and timestamp.")
+        return
+
+    options = ["All learners"] + learners
+    current = S.get("learner")
+    default_index = options.index(current) if current in options else 0
+    selected = st.selectbox("Show memory for", options, index=default_index, key="memory_learner_filter")
+    visible = [row for row in rows if selected == "All learners" or row[2] == selected]
+    st.metric("Saved episodes", len(visible))
+    st.caption(
+        "An episode is created after each submitted answer. The tutor can use the result and teaching method "
+        "as evidence when adapting the current lesson. The screen below shows the stored records themselves."
+    )
+    display_rows = [{
+        "Record ID": row[0],
+        "Run ID": row[1],
+        "Learner": row[2],
+        "Topic": row[3],
+        "Concept": row[4],
+        "Question": row[5],
+        "Saved answer": row[6],
+        "Result": str(row[7]).title(),
+        "Teaching method": row[8],
+        "Next action": row[9],
+        "Saved at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row[10])),
+    } for row in visible]
+    st.dataframe(display_rows, hide_index=True, use_container_width=True)
+
+
+def screen_procedural_memory(S):
+    page_head("Procedural memory", "The tutor’s teaching skill, learned from answer outcomes.")
+    show_warning(
+        "This view is visible to app visitors. It shows strategy counts by learner and level; "
+        "use Delete my saved data to remove a learner’s procedural memory."
+    )
+    rows, learners = load_procedural_memory()
+    if not rows:
+        st.info("No teaching-strategy evidence yet. As the learner answers questions, this page will show which approaches helped.")
+        st.markdown(
+            "The tutor starts by trying its three alternate explanation styles in turn. "
+            "After it has at least two answer outcomes for each style at the learner’s current level, "
+            "it will favor the style with the highest correct-answer rate."
+        )
+        return
+
+    options = ["All learners"] + learners
+    current = S.get("learner")
+    default_index = options.index(current) if current in options else 0
+    selected = st.selectbox("Show teaching skill for", options, index=default_index, key="procedural_learner_filter")
+    visible = [row for row in rows if selected == "All learners" or row[0] == selected]
+
+    levels = sorted({row[1] for row in visible})
+    if selected == current:
+        learner_level = (S.get("profile") or {}).get("level", "not set")
+    elif selected != "All learners" and len(levels) == 1:
+        learner_level = levels[0]
+    else:
+        learner_level = None
+    recommendations = {}
+    groups = {}
+    for row in visible:
+        if row[2].startswith("change_style:"):
+            groups.setdefault((row[0], row[1]), {})[row[2].split(":", 1)[1]] = row
+    for group, style_rows in groups.items():
+        if all(style_rows.get(style) and style_rows[style][3] >= 2 for style in STYLE_IDEAS):
+            best_rate = max(style_rows[style][4] / style_rows[style][3] for style in STYLE_IDEAS)
+            best_styles = [style for style in STYLE_IDEAS
+                           if style_rows[style][4] / style_rows[style][3] == best_rate]
+            recommendations[group] = min(best_styles, key=lambda style: (style_rows[style][3], STYLE_IDEAS.index(style)))
+    active_key = (selected, learner_level) if selected != "All learners" and learner_level else None
+    recommended = recommendations.get(active_key) if active_key else None
+    st.caption(
+        "A successful trial is a correct answer; partial answers and answers needing more help are tracked separately. "
+        "The current rule only changes which alternate explanation style is chosen. The hint/change-style/review sequence stays rule-based."
+    )
+    if selected != "All learners" and learner_level:
+        style_rows = groups.get(active_key, {})
+        evidence_count = sum(style_rows.get(style, (None, None, None, 0))[3] for style in STYLE_IDEAS)
+        st.metric("Alternate-style examples", f"{evidence_count} / 6 minimum")
+    if recommended:
+        best_rate = style_rows[recommended][4] / style_rows[recommended][3]
+        st.success(f"Current evidence favors **{recommended}** for this learner and level ({best_rate:.0%} correct).")
+    elif selected == "All learners":
+        st.info("Select one learner to see their active style recommendation. The table marks recommendations once evidence is sufficient.")
+    else:
+        st.info("Still collecting examples. The tutor uses a balanced rotation until every alternate style has at least two outcomes.")
+
+    display = []
+    for row in visible:
+        learner_name, level, strategy, attempts, correct, partial, unsuccessful, updated = row
+        if strategy.startswith("change_style:"):
+            style_name = strategy.split(":", 1)[1]
+            shown_strategy = "Alternate explanation: " + style_name
+            status = "Recommended" if recommendations.get((learner_name, level)) == style_name else ""
+        else:
+            shown_strategy = strategy.replace("_", " ").title()
+            status = ""
+        display.append({
+            "Level": level.title(),
+            "Teaching procedure": shown_strategy,
+            "Trials": attempts,
+            "Correct": correct,
+            "Partial": partial,
+            "Needed more help": unsuccessful,
+            "Correct rate": f"{correct / attempts:.0%}" if attempts else "—",
+            "Current choice": status,
+            "Updated": time.strftime("%Y-%m-%d %H:%M", time.localtime(updated)),
+        })
+    st.dataframe(display, hide_index=True, use_container_width=True)
+    with st.expander("How the teaching skill learns"):
+        st.markdown(
+            "1. Each answer updates a count for the method used, learner, and level.\n"
+            "2. For **change style**, the record also includes the actual alternate style used.\n"
+            "3. Before evidence is sufficient, the tutor chooses the least-tried alternate style to gather balanced examples.\n"
+            "4. After two outcomes for each of the three styles, it favors the style with the highest correct-answer rate. "
+            "Ties favor the less-tried style.\n"
+            "5. The data is stored in `procedural_memory`; deleting the learner’s saved data removes these counts."
+        )
 
 
 def screen_profiles():
@@ -2757,6 +3244,12 @@ def main():
         return
     if st.session_state["app_view"] == "dashboard":
         screen_profiles()
+        return
+    if st.session_state["app_view"] == "memory":
+        screen_memory(S)
+        return
+    if st.session_state["app_view"] == "procedural_memory":
+        screen_procedural_memory(S)
         return
     if st.session_state["app_view"] == "home":
         screen_start(S)
