@@ -82,6 +82,43 @@ def safe_exception_summary(error):
         status = getattr(deepest, "status_code", None)
     summary = " -> ".join(chain) or "UnknownError"
     return f"{summary} (HTTP {status})" if isinstance(status, int) and status > 0 else summary
+
+
+def rate_limit_retry_delay(error, retry_number, max_wait_seconds=10):
+    """Return a short retry delay for HTTP 429, or None for other/long failures."""
+    current = error
+    seen = set()
+    retry_after = None
+    status = None
+    for _ in range(5):
+        if not isinstance(current, BaseException) or id(current) in seen:
+            break
+        seen.add(id(current))
+        status = status or getattr(current, "status", None) or getattr(current, "status_code", None)
+        try:
+            status = int(status) if status is not None else None
+        except (TypeError, ValueError):
+            status = None
+        response = getattr(current, "response", None)
+        headers = getattr(response, "headers", None) or getattr(current, "headers", None)
+        if headers:
+            raw = headers.get("retry-after") or headers.get("Retry-After")
+            if raw is not None:
+                try:
+                    retry_after = float(raw)
+                except (TypeError, ValueError):
+                    retry_after = None
+        nested = getattr(current, "inner_exception", None)
+        if not isinstance(nested, BaseException):
+            nested = current.__cause__ or current.__context__
+        current = nested
+    if status != 429:
+        return None
+    delay = retry_after if retry_after is not None else (1.5 * (2 ** retry_number))
+    # Do not retry earlier than the provider asks; skip this retry if its wait is too long.
+    if delay < 0 or delay > max_wait_seconds:
+        return None
+    return delay
 NUM_CONCEPTS = 3                      # how many concepts the Architect plans (+1 final challenge)
 MAX_ATTEMPTS_PER_CONCEPT = 8          # safety limit: the teaching loop can never run forever
 LESSON_LANGUAGE = "English"           # language of lessons, questions and feedback
@@ -308,7 +345,21 @@ def run_nemo_guardrail(S, direction, messages):
             name="guardrail-check",
             metadata={"direction": direction},
         ) as observation:
-            result = rails.check(messages, rail_types=[rail_type])
+            # Groq may briefly return 429 during traffic bursts. Retry only those
+            # transient failures, with a small bound and the provider's Retry-After.
+            for retry_number in range(3):
+                try:
+                    result = rails.check(messages, rail_types=[rail_type])
+                    break
+                except Exception as check_error:
+                    delay = rate_limit_retry_delay(check_error, retry_number)
+                    if delay is None or retry_number == 2:
+                        raise
+                    LOGGER.info(
+                        "NeMo %s check hit HTTP 429; retrying (attempt %s/3) after %.1f seconds.",
+                        direction, retry_number + 2, delay,
+                    )
+                    time.sleep(delay)
             status = str(getattr(result.status, "value", result.status)).upper().split(".")[-1]
             if status not in ("PASSED", "MODIFIED", "BLOCKED"):
                 status = "ERROR"
@@ -2184,6 +2235,8 @@ def run_with_spinner(message, fn, *args):
         return True
     except GuardrailsUnavailableError as e:
         st.error(f"Safety check unavailable: {e}")
+        if "HTTP 429" in str(e) or "LLMRateLimitError" in str(e):
+            st.warning("Groq is temporarily rate-limiting safety checks. Wait 30 seconds, then resend your query.")
         return False
     except GuardrailsBlockedError as e:
         st.error(f"Safety check: {e}\n\nPlease choose a safe educational topic or rephrase your answer.")
